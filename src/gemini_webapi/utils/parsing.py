@@ -1,3 +1,5 @@
+import re
+import reprlib
 from typing import Any
 
 import orjson as json
@@ -5,184 +7,201 @@ import orjson as json
 from .logger import logger
 
 
-def get_nested_value(data: list, path: list[int], default: Any = None) -> Any:
+_LENGTH_MARKER_PATTERN = re.compile(r"(\d+)\n")
+
+
+def _get_char_count_for_utf16_units(
+    s: str, start_idx: int, utf16_units: int
+) -> tuple[int, int]:
     """
-    Safely get a value from a nested list by a sequence of indices.
+    Calculate the number of Python characters (code points) and actual UTF-16
+    units found.
+    """
+
+    count = 0
+    units = 0
+    limit = len(s)
+
+    while units < utf16_units and (start_idx + count) < limit:
+        char = s[start_idx + count]
+        u = 2 if ord(char) > 0xFFFF else 1
+        if units + u > utf16_units:
+            break
+        units += u
+        count += 1
+
+    return count, units
+
+
+def get_nested_value(
+    data: Any, path: list[int | str], default: Any = None, verbose: bool = False
+) -> Any:
+    """
+    Safely navigate through a nested structure (list or dict) using a sequence of keys/indices.
 
     Parameters
     ----------
-    data: `list`
-        The nested list to traverse.
-    path: `list[int]`
-        A list of indices representing the path to the desired value.
-    default: `Any`, optional
-        The default value to return if the path is not found.
+    data: `Any`
+        The nested structure to traverse.
+    path: `list[int | str]`
+        A list of indices or keys representing the path.
+    default: `Any`
+        Value to return if the path is invalid.
+    verbose: `bool`
+        If True, log debug information when the path cannot be fully traversed.
     """
 
     current = data
 
     for i, key in enumerate(path):
-        try:
-            current = current[key]
-        except (IndexError, TypeError, KeyError):
-            current_repr = repr(current)
-            if len(current_repr) > 200:
-                current_repr = f"{current_repr[:197]}..."
+        found = False
+        if isinstance(key, int):
+            if isinstance(current, list) and -len(current) <= key < len(current):
+                current = current[key]
+                found = True
+        elif isinstance(key, str):
+            if isinstance(current, dict) and key in current:
+                current = current[key]
+                found = True
 
-            logger.debug(
-                f"Safe navigation: path {path} ended at index {i} (key '{key}'), "
-                f"returning default. Context: {current_repr}"
-            )
-
+        if not found:
+            if verbose:
+                logger.debug(
+                    f"Safe navigation: path {path} ended at index {i} (key '{key}'), "
+                    f"returning default. Context: {reprlib.repr(current)}"
+                )
             return default
 
-    if current is None and default is not None:
-        return default
-
-    return current
-
-
-def _maybe_unwrap(parsed: list) -> list:
-    """Unwrap if it's a list with a single list element."""
-    if isinstance(parsed, list) and len(parsed) == 1 and isinstance(parsed[0], list):
-        return parsed[0]
-    return parsed
-
-
-def _sanitize_json_newlines(text: str) -> str:
-    """Sanitize newlines inside JSON strings.
-
-    This function handles two cases:
-    1. Raw newlines inside strings are replaced with \\n escape sequence
-    2. \\n escape sequences inside strings are converted to \\\\n to preserve
-       them as literal backslash+n (for compatibility with some data formats)
-
-    JSON strings cannot contain raw newlines - they must be escaped.
-    """
-    result = []
-    in_string = False
-    i = 0
-
-    while i < len(text):
-        char = text[i]
-
-        # Check for quote (need to count preceding backslashes to know if escaped)
-        if char == '"':
-            num_backslashes = 0
-            j = len(result) - 1
-            while j >= 0 and result[j] == '\\':
-                num_backslashes += 1
-                j -= 1
-            # If odd number of backslashes before quote, it's escaped
-            if num_backslashes % 2 == 0:
-                in_string = not in_string
-            result.append(char)
-            i += 1
-            continue
-
-        # Check for backslash-n sequence inside string
-        if in_string and char == '\\' and i + 1 < len(text) and text[i + 1] == 'n':
-            # Convert \n to \\n to preserve as literal backslash+n
-            result.append('\\\\n')
-            i += 2
-            continue
-
-        # Check for raw newline inside string
-        if in_string and char == '\n':
-            # Replace with escaped newline
-            result.append('\\n')
-            i += 1
-            continue
-
-        result.append(char)
-        i += 1
-
-    return ''.join(result)
+    return current if current is not None else default
 
 
 def _parse_with_length_markers(content: str) -> list | None:
-    """Parse using Google RPC length-marker format."""
-    import re
+    """
+    Parse streaming responses using length markers as hints.
+    Google's format: [length]\n[json_payload]\n
+    The length value includes the newline after the number and the newline after the JSON.
+    """
 
     pos = 0
-    while pos < len(content):
-        # Skip whitespace
-        while pos < len(content) and content[pos] in ' \t\n':
+    total_len = len(content)
+    collected_chunks = []
+
+    while pos < total_len:
+        while pos < total_len and content[pos].isspace():
             pos += 1
-        if pos >= len(content):
+
+        if pos >= total_len:
             break
 
-        # Try to match length marker
-        match = re.match(r'(\d+)\n', content[pos:])
-        if match:
-            start = pos + match.end()
-            # Try to parse JSON from this position (ignore the byte count from marker)
-            remaining = content[start:]
+        match = _LENGTH_MARKER_PATTERN.match(content, pos=pos)
+        if not match:
+            break
 
-            # Sanitize newlines inside strings before parsing
-            sanitized = _sanitize_json_newlines(remaining)
+        length_val = match.group(1)
+        length = int(length_val)
+
+        # Content starts immediately after the digits.
+        # Google uses UTF-16 code units (JavaScript .length) for the length marker.
+        start_content = match.start() + len(length_val)
+        char_count, units_found = _get_char_count_for_utf16_units(
+            content, start_content, length
+        )
+        end_hint = start_content + char_count
+        pos = end_hint
+
+        if units_found < length:
+            logger.debug(
+                f"Chunk at pos {start_content} is truncated. Expected {length} UTF-16 units, got {units_found}."
+            )
+            break
+
+        chunk = content[start_content:end_hint].strip()
+        if not chunk:
+            continue
+
+        try:
+            parsed = json.loads(chunk)
+            if isinstance(parsed, list):
+                collected_chunks.extend(parsed)
+            else:
+                collected_chunks.append(parsed)
+        except json.JSONDecodeError:
+            logger.warning(
+                f"Failed to parse chunk at pos {start_content} with length {length}. "
+                f"Snippet: {reprlib.repr(chunk)}"
+            )
+
+    return collected_chunks if collected_chunks else None
+
+
+def parse_stream_frames(buffer: str) -> tuple[list[Any], str]:
+    """
+    Parse as many JSON frames as possible from an accumulated buffer.
+
+    This function implements Google's length-prefixed framing protocol. Each frame starts
+    with a length marker (number of characters) followed by a newline and the JSON content.
+    If a frame is partially received, it stays in the buffer for the next call.
+
+    Parameters
+    ----------
+    buffer: `str`
+        The accumulated string buffer containing raw streaming data from the API.
+
+    Returns
+    -------
+    `tuple[list[Any], str]`
+        A tuple containing:
+        - A list of parsed JSON objects (envelopes) extracted from the buffer.
+        - The remaining unparsed part of the buffer (incomplete frames).
+    """
+
+    pos = 0
+    total_len = len(buffer)
+    parsed_objects = []
+
+    while pos < total_len:
+        while pos < total_len and buffer[pos].isspace():
+            pos += 1
+
+        if pos >= total_len:
+            break
+
+        match = _LENGTH_MARKER_PATTERN.match(buffer, pos=pos)
+        if not match:
+            # If we have a prefix but no length marker yet, wait for more data
+            break
+
+        length_val = match.group(1)
+        length = int(length_val)
+        start_content = match.start() + len(length_val)
+        char_count, units_found = _get_char_count_for_utf16_units(
+            buffer, start_content, length
+        )
+
+        if units_found < length:
+            # Chunk is truncated, wait for more data
+            break
+
+        end_pos = start_content + char_count
+        chunk = buffer[start_content:end_pos].strip()
+        pos = end_pos
+
+        if chunk:
             try:
-                parsed = json.loads(sanitized)
-                return _maybe_unwrap(parsed)
+                parsed = json.loads(chunk)
+                if isinstance(parsed, list):
+                    parsed_objects.extend(parsed)
+                else:
+                    parsed_objects.append(parsed)
             except json.JSONDecodeError:
-                # Try to find the end of a valid JSON chunk by incrementally parsing
-                # Look for balanced brackets/braces
-                if remaining.startswith('[') or remaining.startswith('{'):
-                    bracket_count = 0
-                    in_string = False
-                    escape_next = False
-                    for i, char in enumerate(remaining):
-                        if escape_next:
-                            escape_next = False
-                            continue
-                        if char == '\\' and in_string:
-                            escape_next = True
-                            continue
-                        if char == '"' and not escape_next:
-                            in_string = not in_string
-                            continue
-                        if not in_string:
-                            if char in '[{':
-                                bracket_count += 1
-                            elif char in ']}':
-                                bracket_count -= 1
-                                if bracket_count == 0:
-                                    chunk = remaining[:i+1]
-                                    sanitized_chunk = _sanitize_json_newlines(chunk)
-                                    try:
-                                        parsed = json.loads(sanitized_chunk)
-                                        return _maybe_unwrap(parsed)
-                                    except json.JSONDecodeError:
-                                        break
-                # Move past this marker and try next
-                pos = start
-                continue
-        else:
-            break
+                logger.debug(f"Streaming: Failed to parse chunk: {reprlib.repr(chunk)}")
 
-    return None
+    return parsed_objects, buffer[pos:]
 
 
 def extract_json_from_response(text: str) -> list:
     """
-    Clean and extract the JSON content from a Google API response.
-
-    Parameters
-    ----------
-    text: `str`
-        The raw response text from a Google API.
-
-    Returns
-    -------
-    `list`
-        The extracted JSON array or object (should be an array).
-
-    Raises
-    ------
-    `TypeError`
-        If the input is not a string.
-    `ValueError`
-        If no JSON object is found or the response is empty.
+    Extract and normalize JSON content from a Google API response.
     """
 
     if not isinstance(text, str):
@@ -190,24 +209,42 @@ def extract_json_from_response(text: str) -> list:
             f"Input text is expected to be a string, got {type(text).__name__} instead."
         )
 
-    # Remove XSSI header (may include extra quotes after )]})
-    content = text.strip()
+    content = text
     if content.startswith(")]}'"):
         content = content[4:]
-        # Strip any additional quotes or apostrophes after the XSSI header
-        content = content.lstrip("'\"\n")
 
-    # Try length-marker parsing first
+    content = content.lstrip()
+
+    # Extract with a length marker
     result = _parse_with_length_markers(content)
     if result is not None:
         return result
 
-    # Fallback to line-by-line
-    for line in content.splitlines():
+    # Extract the entire content
+    content_stripped = content.strip()
+    try:
+        parsed = json.loads(content_stripped)
+        return parsed if isinstance(parsed, list) else [parsed]
+    except json.JSONDecodeError:
+        pass
+
+    # Extract with NDJSON
+    collected_lines = []
+    for line in content_stripped.splitlines():
+        line = line.strip()
+        if not line:
+            continue
         try:
-            return json.loads(line.strip())
+            parsed = json.loads(line)
         except json.JSONDecodeError:
             continue
 
-    # If no JSON is found, raise ValueError
+        if isinstance(parsed, list):
+            collected_lines.extend(parsed)
+        elif isinstance(parsed, dict):
+            collected_lines.append(parsed)
+
+    if collected_lines:
+        return collected_lines
+
     raise ValueError("Could not find a valid JSON object or array in the response.")
