@@ -605,11 +605,15 @@ class GeminiClient(GemMixin):
                             yield recovered
                             return
                     except Exception as e:
-                        logger.warning(f"READ_CHAT recovery failed: {e}")
+                        logger.warning(
+                            f"READ_CHAT recovery failed for cid={chat.cid!r}: "
+                            f"{type(e).__name__}: {e}"
+                        )
 
+                    # GeminiError (not APIError) prevents @running from retrying
                     raise GeminiError(
-                        "Stream failed after Gemini created a new conversation. "
-                        "Recovery via READ_CHAT also failed. "
+                        f"Stream failed after Gemini assigned cid={chat.cid!r}. "
+                        "Recovery via READ_CHAT returned no data. "
                         "Retrying would create a duplicate conversation thread."
                     )
 
@@ -973,6 +977,22 @@ class GeminiClient(GemMixin):
         )
 
     async def read_chat(self, cid: str) -> ModelOutput | None:
+        """
+        Fetch the last assistant response from a conversation by chat id.
+
+        Used for recovery when a stream fails after Gemini assigned a cid
+        mid-stream. Returns None on any failure (network, parsing, empty response).
+
+        Parameters
+        ----------
+        cid: `str`
+            The ID of the conversation to read (e.g. "c_...").
+
+        Returns
+        -------
+        :class:`ModelOutput` | None
+            The recovered response, or None if recovery failed.
+        """
         try:
             response = await self._batch_execute(
                 [
@@ -992,10 +1012,14 @@ class GeminiClient(GemMixin):
 
                 part_body = json.loads(part_body_str)
 
-                # READ_CHAT response: part_body[0][0] is the conversation turn
+                # READ_CHAT response: part_body[0] is the list of conversation turns
+                # Use [-1] to get the latest turn (the one being recovered)
                 # turn[3] holds the assistant response with candidates
-                # turn[3][0] is the candidates list (same structure as StreamGenerate)
-                conv_turn = get_nested_value(part_body, [0, 0])
+                # turn[3][0] is the candidates list (candidate structure matches StreamGenerate)
+                turns = get_nested_value(part_body, [0])
+                if not turns:
+                    continue
+                conv_turn = turns[-1]
                 if not conv_turn:
                     continue
 
@@ -1003,8 +1027,8 @@ class GeminiClient(GemMixin):
                 if not candidates_list:
                     continue
 
-                # Take the first candidate (same as StreamGenerate)
-                candidate_data = candidates_list[0] if candidates_list else None
+                # Extract first candidate (candidate structure matches StreamGenerate)
+                candidate_data = get_nested_value(candidates_list, [0])
                 if not candidate_data:
                     continue
 
@@ -1017,7 +1041,8 @@ class GeminiClient(GemMixin):
                 )
 
             return None
-        except Exception:
+        except Exception as e:
+            logger.warning(f"read_chat({cid!r}) failed: {type(e).__name__}: {e}")
             return None
 
     @running(retry=2)

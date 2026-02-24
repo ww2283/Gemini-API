@@ -8,9 +8,6 @@ when _generate() is retried after an APIError, and the ChatSession started with
 an empty cid but now has a truthy cid (assigned by Gemini mid-stream), the retry
 should be aborted by raising GeminiError (which the @running decorator does NOT
 catch) instead of allowing a duplicate conversation to be created.
-
-All tests are expected to FAIL until the guard logic is implemented in
-GeminiClient._generate().
 """
 
 import asyncio
@@ -119,8 +116,8 @@ class TestRetryAbortOnCidAssignedMidstream(unittest.IsolatedAsyncioTestCase):
           1. ChatSession starts with cid="" (new conversation).
           2. During the first call to _generate(), the HTTP response returns
              status 500. Before the APIError is raised, the close() side-effect
-             simulates Gemini having assigned a cid (as would happen at line 692
-             if some metadata arrived before the stream broke).
+             simulates Gemini having assigned a cid (as happens when metadata
+             arrives before the stream broke).
           3. The @running decorator catches APIError and retries _generate().
           4. On retry entry, the guard should detect that original_cid was ""
              but chat.cid is now truthy, and raise GeminiError to abort.
@@ -148,8 +145,8 @@ class TestRetryAbortOnCidAssignedMidstream(unittest.IsolatedAsyncioTestCase):
             nonlocal stream_call_count
             stream_call_count += 1
             if stream_call_count == 1:
-                # Simulates what happens at line 692 when Gemini returns
-                # metadata with a conversation id before the stream fails.
+                # Simulates Gemini returning metadata with a conversation id
+                # before the stream fails.
                 chat.cid = "c_abc123_assigned_midstream"
 
         client.client.stream = _make_fail_stream(
@@ -334,7 +331,6 @@ class TestSessionStateTracksOriginalCid(unittest.IsolatedAsyncioTestCase):
                 pass  # Expected -- we just want to inspect session_state
 
         # The critical assertion: session_state should now contain original_cid.
-        # This will FAIL because _generate() does not yet track original_cid.
         self.assertIn(
             "original_cid",
             session_state,
@@ -360,8 +356,6 @@ class TestRetryRecoveryViaReadChat(unittest.IsolatedAsyncioTestCase):
     - If read_chat() returns None: raise GeminiError as before.
     - If read_chat() raises an exception: raise GeminiError as before.
 
-    These tests define the NEW expected behavior and will FAIL until the
-    recovery logic is implemented in GeminiClient._generate().
     """
 
     def _setup_midstream_cid_scenario(self):

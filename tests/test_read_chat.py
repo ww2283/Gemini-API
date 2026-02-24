@@ -2,11 +2,8 @@
 Tests for GeminiClient.read_chat(cid) -- Phase A+B of response recovery.
 
 read_chat() fetches a conversation's content by cid using the GRPC.READ_CHAT
-RPC, parses the batchexecute response, finds the last assistant message, and
-returns a ModelOutput (or None on failure).
-
-All tests are expected to FAIL until read_chat() is implemented in
-GeminiClient.
+RPC, parses the batchexecute response, extracts the latest assistant message,
+and returns a ModelOutput (or None on failure).
 """
 
 import asyncio
