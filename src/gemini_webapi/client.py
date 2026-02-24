@@ -31,6 +31,7 @@ from .types import (
     WebImage,
 )
 from .utils import (
+    extract_json_from_response,
     get_access_token,
     get_delta_by_fp_len,
     get_nested_value,
@@ -588,6 +589,34 @@ class GeminiClient(GemMixin):
                 ).decode("utf-8"),
             }
 
+            if session_state is not None:
+                if "original_cid" not in session_state:
+                    session_state["original_cid"] = chat.cid if chat else None
+
+                if chat and session_state.get("original_cid") in ("", None) and chat.cid:
+                    logger.warning(
+                        f"Stream failed after Gemini assigned cid={chat.cid!r}. "
+                        "Attempting to recover response via READ_CHAT..."
+                    )
+                    try:
+                        recovered = await self.read_chat(chat.cid)
+                        if recovered:
+                            logger.info("Successfully recovered response via READ_CHAT.")
+                            yield recovered
+                            return
+                    except Exception as e:
+                        logger.warning(
+                            f"READ_CHAT recovery failed for cid={chat.cid!r}: "
+                            f"{type(e).__name__}: {e}"
+                        )
+
+                    # GeminiError (not APIError) prevents @running from retrying
+                    raise GeminiError(
+                        f"Stream failed after Gemini assigned cid={chat.cid!r}. "
+                        "Recovery via READ_CHAT returned no data. "
+                        "Retrying would create a duplicate conversation thread."
+                    )
+
             async with self.client.stream(
                 "POST",
                 Endpoint.GENERATE,
@@ -946,6 +975,75 @@ class GeminiClient(GemMixin):
                 ),
             ]
         )
+
+    async def read_chat(self, cid: str) -> ModelOutput | None:
+        """
+        Fetch the last assistant response from a conversation by chat id.
+
+        Used for recovery when a stream fails after Gemini assigned a cid
+        mid-stream. Returns None on any failure (network, parsing, empty response).
+
+        Parameters
+        ----------
+        cid: `str`
+            The ID of the conversation to read (e.g. "c_...").
+
+        Returns
+        -------
+        :class:`ModelOutput` | None
+            The recovered response, or None if recovery failed.
+        """
+        try:
+            response = await self._batch_execute(
+                [
+                    RPCData(
+                        rpcid=GRPC.READ_CHAT,
+                        payload=json.dumps([cid, 1000, None, 1, [1], [4], None, 1]).decode("utf-8"),
+                    ),
+                ]
+            )
+
+            response_json = extract_json_from_response(response.text)
+
+            for part in response_json:
+                part_body_str = get_nested_value(part, [2])
+                if not part_body_str:
+                    continue
+
+                part_body = json.loads(part_body_str)
+
+                # READ_CHAT response: part_body[0] is the list of conversation turns
+                # Use [-1] to get the latest turn (the one being recovered)
+                # turn[3] holds the assistant response with candidates
+                # turn[3][0] is the candidates list (candidate structure matches StreamGenerate)
+                turns = get_nested_value(part_body, [0])
+                if not turns:
+                    continue
+                conv_turn = turns[-1]
+                if not conv_turn:
+                    continue
+
+                candidates_list = get_nested_value(conv_turn, [3, 0])
+                if not candidates_list:
+                    continue
+
+                # Extract first candidate (candidate structure matches StreamGenerate)
+                candidate_data = get_nested_value(candidates_list, [0])
+                if not candidate_data:
+                    continue
+
+                rcid = get_nested_value(candidate_data, [0], "")
+                text = get_nested_value(candidate_data, [1, 0], "")
+
+                return ModelOutput(
+                    metadata=[cid],
+                    candidates=[Candidate(rcid=rcid, text=text)],
+                )
+
+            return None
+        except Exception as e:
+            logger.warning(f"read_chat({cid!r}) failed: {type(e).__name__}: {e}")
+            return None
 
     @running(retry=2)
     async def _batch_execute(self, payloads: list[RPCData], **kwargs) -> Response:
