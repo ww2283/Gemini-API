@@ -588,6 +588,21 @@ class GeminiClient(GemMixin):
                 ).decode("utf-8"),
             }
 
+            if session_state is not None:
+                if "original_cid" not in session_state:
+                    session_state["original_cid"] = chat.cid if chat else None
+
+                if chat and session_state.get("original_cid") in ("", None) and chat.cid:
+                    logger.warning(
+                        f"Aborting retry: Gemini already assigned cid={chat.cid!r} during a failed attempt. "
+                        "Retrying would create a duplicate conversation thread."
+                    )
+                    raise GeminiError(
+                        "Stream failed after Gemini created a new conversation. "
+                        "Check Gemini web UI for partial response. "
+                        "Retrying would create a duplicate conversation thread."
+                    )
+
             async with self.client.stream(
                 "POST",
                 Endpoint.GENERATE,
