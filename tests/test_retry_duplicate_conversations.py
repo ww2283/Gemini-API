@@ -349,5 +349,158 @@ class TestSessionStateTracksOriginalCid(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class TestRetryRecoveryViaReadChat(unittest.IsolatedAsyncioTestCase):
+    """
+    When the duplicate-conversation guard detects that a cid was assigned
+    mid-stream (chat started with cid="" but now has a truthy cid), the
+    guard should attempt to recover the partial response via read_chat()
+    before raising GeminiError.
+
+    - If read_chat() returns a ModelOutput: yield it and return (no error).
+    - If read_chat() returns None: raise GeminiError as before.
+    - If read_chat() raises an exception: raise GeminiError as before.
+
+    These tests define the NEW expected behavior and will FAIL until the
+    recovery logic is implemented in GeminiClient._generate().
+    """
+
+    def _setup_midstream_cid_scenario(self):
+        """Common setup: chat starts with cid="", cid gets assigned on first
+        stream entry, stream returns 500 -> APIError -> retry triggers guard.
+
+        Returns (client, chat, session_state) tuple.
+        """
+        client = _make_running_client()
+        chat = _make_chat_session(client, cid="")
+
+        session_state = {
+            "last_texts": {},
+            "last_thoughts": {},
+            "last_progress_time": time.time(),
+        }
+
+        stream_call_count = 0
+
+        def on_stream_enter():
+            nonlocal stream_call_count
+            stream_call_count += 1
+            if stream_call_count == 1:
+                chat.cid = "c_recovered_123"
+
+        client.client.stream = _make_fail_stream(
+            status_code=500, on_enter=on_stream_enter
+        )
+
+        return client, chat, session_state
+
+    async def test_recovery_succeeds_yields_model_output(self):
+        """
+        When the guard triggers AND read_chat() returns a ModelOutput,
+        the generator should yield that ModelOutput and NOT raise GeminiError.
+
+        This validates that partial responses can be recovered from Gemini's
+        server after a mid-stream failure, avoiding both data loss and
+        duplicate conversation creation.
+        """
+        from gemini_webapi.types import ModelOutput, Candidate
+
+        client, chat, session_state = self._setup_midstream_cid_scenario()
+
+        # Construct a realistic ModelOutput that read_chat would return
+        recovered_candidate = Candidate(
+            rcid="rc_recovered",
+            text="This is the recovered partial response.",
+        )
+        recovered_output = ModelOutput(
+            metadata=["c_recovered_123", "r_123", "rc_recovered"],
+            candidates=[recovered_candidate],
+        )
+
+        # Mock read_chat to return the recovered output
+        client.read_chat = AsyncMock(return_value=recovered_output)
+
+        outputs = []
+        with patch("gemini_webapi.utils.decorators.DELAY_FACTOR", 0):
+            # Should NOT raise -- recovery succeeds
+            async for output in client._generate(
+                prompt="test prompt",
+                chat=chat,
+                session_state=session_state,
+            ):
+                outputs.append(output)
+
+        # read_chat should have been called with the assigned cid
+        client.read_chat.assert_awaited_once_with("c_recovered_123")
+
+        # The recovered ModelOutput should be among the yielded outputs
+        self.assertTrue(
+            any(o is recovered_output for o in outputs),
+            "The recovered ModelOutput from read_chat() should be yielded "
+            "by the generator, but it was not found in the outputs.",
+        )
+
+    async def test_recovery_fails_raises_gemini_error(self):
+        """
+        When the guard triggers AND read_chat() returns None (no response
+        found), GeminiError should be raised -- preserving the existing
+        fail-safe behavior for cases where recovery is not possible.
+        """
+        client, chat, session_state = self._setup_midstream_cid_scenario()
+
+        # Mock read_chat to return None (recovery failed)
+        client.read_chat = AsyncMock(return_value=None)
+
+        with patch("gemini_webapi.utils.decorators.DELAY_FACTOR", 0):
+            with self.assertRaises(GeminiError) as ctx:
+                async for _ in client._generate(
+                    prompt="test prompt",
+                    chat=chat,
+                    session_state=session_state,
+                ):
+                    pass
+
+        # read_chat should have been called
+        client.read_chat.assert_awaited_once_with("c_recovered_123")
+
+        self.assertIn(
+            "duplicate",
+            str(ctx.exception).lower(),
+            "GeminiError message should mention duplicate conversation prevention.",
+        )
+
+    async def test_recovery_exception_raises_gemini_error(self):
+        """
+        When the guard triggers AND read_chat() itself raises an exception
+        (e.g., network error during recovery attempt), GeminiError should
+        still be raised -- the recovery attempt must not let unexpected
+        exceptions propagate uncaught.
+        """
+        client, chat, session_state = self._setup_midstream_cid_scenario()
+
+        # Mock read_chat to raise an exception (recovery itself fails)
+        client.read_chat = AsyncMock(
+            side_effect=Exception("network error during recovery")
+        )
+
+        with patch("gemini_webapi.utils.decorators.DELAY_FACTOR", 0):
+            with self.assertRaises(GeminiError) as ctx:
+                async for _ in client._generate(
+                    prompt="test prompt",
+                    chat=chat,
+                    session_state=session_state,
+                ):
+                    pass
+
+        # read_chat should have been called (recovery was attempted)
+        client.read_chat.assert_awaited_once_with("c_recovered_123")
+
+        self.assertIn(
+            "duplicate",
+            str(ctx.exception).lower(),
+            "GeminiError message should mention duplicate conversation prevention "
+            "even when read_chat() raises an exception.",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
