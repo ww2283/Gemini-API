@@ -414,7 +414,8 @@ class TestRetryRecoveryViaReadChat(unittest.IsolatedAsyncioTestCase):
         client.read_chat = AsyncMock(return_value=recovered_output)
 
         outputs = []
-        with patch("gemini_webapi.utils.decorators.DELAY_FACTOR", 0):
+        with patch("gemini_webapi.utils.decorators.DELAY_FACTOR", 0), \
+             patch("gemini_webapi.client.asyncio.sleep", new_callable=AsyncMock):
             # Should NOT raise -- recovery succeeds
             async for output in client._generate(
                 prompt="test prompt",
@@ -423,7 +424,7 @@ class TestRetryRecoveryViaReadChat(unittest.IsolatedAsyncioTestCase):
             ):
                 outputs.append(output)
 
-        # read_chat should have been called with the assigned cid
+        # read_chat should succeed on first attempt (returns value immediately)
         client.read_chat.assert_awaited_once_with("c_recovered_123")
 
         # The recovered ModelOutput should be among the yielded outputs
@@ -438,13 +439,15 @@ class TestRetryRecoveryViaReadChat(unittest.IsolatedAsyncioTestCase):
         When the guard triggers AND read_chat() returns None (no response
         found), GeminiError should be raised -- preserving the existing
         fail-safe behavior for cases where recovery is not possible.
+        read_chat is retried 3 times with increasing delays before giving up.
         """
         client, chat, session_state = self._setup_midstream_cid_scenario()
 
         # Mock read_chat to return None (recovery failed)
         client.read_chat = AsyncMock(return_value=None)
 
-        with patch("gemini_webapi.utils.decorators.DELAY_FACTOR", 0):
+        with patch("gemini_webapi.utils.decorators.DELAY_FACTOR", 0), \
+             patch("gemini_webapi.client.asyncio.sleep", new_callable=AsyncMock):
             with self.assertRaises(GeminiError) as ctx:
                 async for _ in client._generate(
                     prompt="test prompt",
@@ -453,8 +456,8 @@ class TestRetryRecoveryViaReadChat(unittest.IsolatedAsyncioTestCase):
                 ):
                     pass
 
-        # read_chat should have been called
-        client.read_chat.assert_awaited_once_with("c_recovered_123")
+        # read_chat retries 4 times before giving up
+        self.assertEqual(client.read_chat.await_count, 4)
 
         self.assertIn(
             "duplicate",
@@ -467,7 +470,7 @@ class TestRetryRecoveryViaReadChat(unittest.IsolatedAsyncioTestCase):
         When the guard triggers AND read_chat() itself raises an exception
         (e.g., network error during recovery attempt), GeminiError should
         still be raised -- the recovery attempt must not let unexpected
-        exceptions propagate uncaught.
+        exceptions propagate uncaught. All 4 retry attempts should be made.
         """
         client, chat, session_state = self._setup_midstream_cid_scenario()
 
@@ -476,7 +479,8 @@ class TestRetryRecoveryViaReadChat(unittest.IsolatedAsyncioTestCase):
             side_effect=Exception("network error during recovery")
         )
 
-        with patch("gemini_webapi.utils.decorators.DELAY_FACTOR", 0):
+        with patch("gemini_webapi.utils.decorators.DELAY_FACTOR", 0), \
+             patch("gemini_webapi.client.asyncio.sleep", new_callable=AsyncMock):
             with self.assertRaises(GeminiError) as ctx:
                 async for _ in client._generate(
                     prompt="test prompt",
@@ -485,8 +489,8 @@ class TestRetryRecoveryViaReadChat(unittest.IsolatedAsyncioTestCase):
                 ):
                     pass
 
-        # read_chat should have been called (recovery was attempted)
-        client.read_chat.assert_awaited_once_with("c_recovered_123")
+        # read_chat retries 4 times before giving up
+        self.assertEqual(client.read_chat.await_count, 4)
 
         self.assertIn(
             "duplicate",

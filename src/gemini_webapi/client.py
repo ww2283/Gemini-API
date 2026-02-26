@@ -115,7 +115,7 @@ class GeminiClient(GemMixin):
         self.refresh_interval: float = 540
         self.refresh_task: Task | None = None
         self.verbose: bool = True
-        self.watchdog_timeout: float = 60  # ≤ DELAY_FACTOR × retry × (retry + 1) / 2
+        self.watchdog_timeout: float = 30  # seconds before declaring a zombie stream
         self._lock = asyncio.Lock()
         self._reqid: int = random.randint(10000, 99999)
         self.kwargs = kwargs
@@ -135,7 +135,7 @@ class GeminiClient(GemMixin):
         auto_refresh: bool = True,
         refresh_interval: float = 540,
         verbose: bool = True,
-        watchdog_timeout: float = 60,  # ≤ DELAY_FACTOR × retry × (retry + 1) / 2
+        watchdog_timeout: float = 30,  # seconds before declaring a zombie stream
     ) -> None:
         """
         Get SNlM0e value as access token. Without this token posting will fail with 400 bad request.
@@ -238,6 +238,27 @@ class GeminiClient(GemMixin):
 
         if self.client:
             await self.client.aclose()
+
+    async def _reset_connection(self) -> None:
+        """
+        Close and recreate the HTTP transport without re-fetching tokens.
+
+        Use this instead of close() when the connection is broken (zombie stream,
+        HTTP/2 errors) but authentication tokens are still valid. Avoids an
+        unnecessary round-trip to gemini.google.com/app on every retry.
+        """
+        if self.client:
+            await self.client.aclose()
+
+        self.client = AsyncClient(
+            http2=True,
+            timeout=self.timeout,
+            proxy=self.proxy,
+            follow_redirects=True,
+            headers=Headers.GEMINI.value,
+            cookies=self.cookies,
+            **self.kwargs,
+        )
 
     async def reset_close_task(self) -> None:
         """
@@ -594,26 +615,40 @@ class GeminiClient(GemMixin):
                     session_state["original_cid"] = chat.cid if chat else None
 
                 if chat and session_state.get("original_cid") in ("", None) and chat.cid:
-                    logger.warning(
-                        f"Stream failed after Gemini assigned cid={chat.cid!r}. "
-                        "Attempting to recover response via READ_CHAT..."
-                    )
-                    try:
-                        recovered = await self.read_chat(chat.cid)
-                        if recovered:
-                            logger.info("Successfully recovered response via READ_CHAT.")
-                            yield recovered
-                            return
-                    except Exception as e:
+                    # Poll read_chat with exponential backoff. Google's Pro backend
+                    # needs ~50-60s to persist responses after a stream break.
+                    # Budget: 30 + 45 + 60 + 90 = 225s max wait, 4 requests.
+                    read_chat_delays = [30, 45, 60, 90]
+                    for attempt, delay in enumerate(read_chat_delays, 1):
                         logger.warning(
-                            f"READ_CHAT recovery failed for cid={chat.cid!r}: "
-                            f"{type(e).__name__}: {e}"
+                            f"Stream failed after Gemini assigned cid={chat.cid!r}. "
+                            f"READ_CHAT attempt {attempt}/{len(read_chat_delays)}: "
+                            f"waiting {delay}s for server to persist..."
                         )
+                        await asyncio.sleep(delay)
+                        try:
+                            recovered = await self.read_chat(chat.cid)
+                            if recovered:
+                                logger.info(
+                                    f"Successfully recovered response via READ_CHAT "
+                                    f"(attempt {attempt}/{len(read_chat_delays)})."
+                                )
+                                yield recovered
+                                return
+                            logger.debug(
+                                f"READ_CHAT attempt {attempt} returned None"
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"READ_CHAT attempt {attempt} failed for cid={chat.cid!r}: "
+                                f"{type(e).__name__}: {e}"
+                            )
 
                     # GeminiError (not APIError) prevents @running from retrying
                     raise GeminiError(
                         f"Stream failed after Gemini assigned cid={chat.cid!r}. "
-                        "Recovery via READ_CHAT returned no data. "
+                        f"Recovery via READ_CHAT returned no data after "
+                        f"{len(read_chat_delays)} attempts (~{sum(read_chat_delays)}s). "
                         "Retrying would create a duplicate conversation thread."
                     )
 
@@ -909,7 +944,7 @@ class GeminiClient(GemMixin):
                                 f"Response stalled (active connection but no progress for {stall_threshold}s). "
                                 f"Queueing={is_queueing}. Retrying..."
                             )
-                            await self.close()
+                            await self._reset_connection()
                             raise APIError("Response stalled (zombie stream).")
 
                 # Final flush
@@ -934,8 +969,10 @@ class GeminiClient(GemMixin):
         except (GeminiError, APIError):
             raise
         except Exception as e:
-            logger.debug(
-                f"{type(e).__name__}: {e}; Unexpected response or parsing error. Response: {locals().get('response', 'N/A')}"
+            logger.warning(
+                f"Stream error: {type(e).__name__}: {e}; "
+                f"chat.cid={getattr(chat, 'cid', None)!r}, "
+                f"model={getattr(model, 'model_name', model)!r}"
             )
             raise APIError(f"Failed to parse response body: {e}")
 
@@ -998,16 +1035,24 @@ class GeminiClient(GemMixin):
                 [
                     RPCData(
                         rpcid=GRPC.READ_CHAT,
-                        payload=json.dumps([cid, 1000, None, 1, [1], [4], None, 1]).decode("utf-8"),
+                        payload=json.dumps([cid, 10, None, 1, [0], [4], None, 1]).decode("utf-8"),
                     ),
                 ]
             )
 
-            response_json = extract_json_from_response(response.text)
+            logger.debug(
+                f"read_chat({cid!r}) raw response: status={response.status_code}, "
+                f"len={len(response.text)}, first_500={response.text[:500]!r}"
+            )
 
-            for part in response_json:
+            response_json = extract_json_from_response(response.text)
+            logger.debug(f"read_chat({cid!r}) parsed {len(response_json)} top-level parts")
+
+            for i, part in enumerate(response_json):
+                rpc_id = get_nested_value(part, [1])
                 part_body_str = get_nested_value(part, [2])
                 if not part_body_str:
+                    logger.debug(f"read_chat part[{i}] rpc={rpc_id}: no body at [2]")
                     continue
 
                 part_body = json.loads(part_body_str)
@@ -1018,28 +1063,63 @@ class GeminiClient(GemMixin):
                 # turn[3][0] is the candidates list (candidate structure matches StreamGenerate)
                 turns = get_nested_value(part_body, [0])
                 if not turns:
+                    logger.debug(
+                        f"read_chat part[{i}] rpc={rpc_id}: no turns at [0], "
+                        f"body type={type(part_body).__name__}, "
+                        f"body_keys={list(range(len(part_body))) if isinstance(part_body, list) else 'N/A'}, "
+                        f"body_len={len(part_body) if isinstance(part_body, (list, dict)) else 'N/A'}"
+                    )
                     continue
+
                 conv_turn = turns[-1]
                 if not conv_turn:
+                    logger.debug(
+                        f"read_chat part[{i}]: turns[-1] is empty/None, "
+                        f"num_turns={len(turns)}"
+                    )
                     continue
+
+                logger.debug(
+                    f"read_chat part[{i}]: last turn len={len(conv_turn) if isinstance(conv_turn, list) else 'N/A'}, "
+                    f"types=[{', '.join(type(x).__name__ for x in conv_turn[:8])}...]"
+                    if isinstance(conv_turn, list) and len(conv_turn) > 0 else
+                    f"read_chat part[{i}]: last turn type={type(conv_turn).__name__}"
+                )
 
                 candidates_list = get_nested_value(conv_turn, [3, 0])
                 if not candidates_list:
+                    # Dump structure around [3] for debugging
+                    turn3 = get_nested_value(conv_turn, [3])
+                    logger.debug(
+                        f"read_chat part[{i}]: no candidates at [3][0], "
+                        f"turn[3] type={type(turn3).__name__}, "
+                        f"turn[3] preview={str(turn3)[:300]!r}"
+                    )
                     continue
 
                 # Extract first candidate (candidate structure matches StreamGenerate)
                 candidate_data = get_nested_value(candidates_list, [0])
                 if not candidate_data:
+                    logger.debug(
+                        f"read_chat part[{i}]: candidates_list[0] empty, "
+                        f"candidates_list len={len(candidates_list)}"
+                    )
                     continue
 
                 rcid = get_nested_value(candidate_data, [0], "")
                 text = get_nested_value(candidate_data, [1, 0], "")
 
+                logger.debug(
+                    f"read_chat({cid!r}) SUCCESS: rcid={rcid!r}, text_len={len(text)}"
+                )
                 return ModelOutput(
                     metadata=[cid],
                     candidates=[Candidate(rcid=rcid, text=text)],
                 )
 
+            logger.warning(
+                f"read_chat({cid!r}) parsed all parts but found no candidates"
+            )
             return None
         except Exception as e:
             logger.warning(f"read_chat({cid!r}) failed: {type(e).__name__}: {e}")

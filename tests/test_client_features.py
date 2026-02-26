@@ -123,7 +123,7 @@ class TestGeminiClient(unittest.IsolatedAsyncioTestCase):
     async def test_thinking_model(self):
         response = await self.geminiclient.generate_content(
             "1+1=?",
-            model=Model.G_3_0_PRO,
+            model=Model.G_3_1_PRO,
         )
         logger.debug(response.thoughts)
         logger.debug(response.text)

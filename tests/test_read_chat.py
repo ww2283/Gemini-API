@@ -190,7 +190,7 @@ class TestReadChatCallsBatchExecute(unittest.IsolatedAsyncioTestCase):
             "First element of the READ_CHAT payload must be the conversation id"
         )
         # Verify the full payload structure
-        expected_payload = [cid, 1000, None, 1, [1], [4], None, 1]
+        expected_payload = [cid, 10, None, 1, [0], [4], None, 1]
         self.assertEqual(payload_parsed, expected_payload)
 
 

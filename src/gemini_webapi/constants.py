@@ -47,8 +47,8 @@ class Headers(Enum):
 
 class Model(Enum):
     UNSPECIFIED = ("unspecified", {}, False)
-    G_3_0_PRO = (
-        "gemini-3.0-pro",
+    G_3_1_PRO = (
+        "gemini-3.1-pro",
         {
             "x-goog-ext-525001261-jspb": '[1,null,null,null,"e6fa609c3fa255c0",null,null,0,[4],null,null,2]'
         },
@@ -76,8 +76,12 @@ class Model(Enum):
 
     @classmethod
     def from_name(cls, name: str):
+        # Legacy name mappings for backward compatibility
+        legacy_names = {"gemini-3.0-pro": "gemini-3.1-pro"}
+        resolved = legacy_names.get(name, name)
+
         for model in cls:
-            if model.model_name == name:
+            if model.model_name == resolved:
                 return model
 
         raise ValueError(
