@@ -20,13 +20,15 @@ classifiers = [
 ]
 requires-python = ">=3.10"
 dependencies = [
-    "browser-cookie3",
     "httpx[http2]~=0.28.1",
     "loguru~=0.7.3",
     "orjson~=3.11.7",
     "pydantic~=2.12.5",
 ]
 dynamic = ["version"]
+
+[project.optional-dependencies]
+browser = ["browser-cookie3"]
 
 [project.urls]
 Repository = "https://github.com/HanaokaYuzu/Gemini-API"
