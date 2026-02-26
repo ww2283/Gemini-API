@@ -613,8 +613,13 @@ class GeminiClient(GemMixin):
             if session_state is not None:
                 if "original_cid" not in session_state:
                     session_state["original_cid"] = chat.cid if chat else None
+                if "had_response_data" not in session_state:
+                    session_state["had_response_data"] = False
 
-                if chat and session_state.get("original_cid") in ("", None) and chat.cid:
+                if chat and chat.cid and (
+                    session_state.get("original_cid") in ("", None)
+                    or session_state.get("had_response_data")
+                ):
                     # Poll read_chat with exponential backoff. Google's Pro backend
                     # needs ~50-60s to persist responses after a stream break.
                     # Budget: 30 + 45 + 60 + 90 = 225s max wait, 4 requests.
@@ -754,6 +759,8 @@ class GeminiClient(GemMixin):
                                 m_data = get_nested_value(part_json, [1])
                                 if m_data and isinstance(chat, ChatSession):
                                     chat.metadata = m_data
+                                    if session_state is not None:
+                                        session_state["had_response_data"] = True
                                 context_str = get_nested_value(part_json, [25])
                                 if isinstance(context_str, str):
                                     is_completed = True
@@ -1109,11 +1116,14 @@ class GeminiClient(GemMixin):
                 rcid = get_nested_value(candidate_data, [0], "")
                 text = get_nested_value(candidate_data, [1, 0], "")
 
+                turn_metadata = get_nested_value(conv_turn, [0])
+                rid = get_nested_value(turn_metadata, [1], "") if isinstance(turn_metadata, list) else ""
+
                 logger.debug(
-                    f"read_chat({cid!r}) SUCCESS: rcid={rcid!r}, text_len={len(text)}"
+                    f"read_chat({cid!r}) SUCCESS: rcid={rcid!r}, rid={rid!r}, text_len={len(text)}"
                 )
                 return ModelOutput(
-                    metadata=[cid],
+                    metadata=[cid, rid],
                     candidates=[Candidate(rcid=rcid, text=text)],
                 )
 

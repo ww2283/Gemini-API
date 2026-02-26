@@ -336,5 +336,117 @@ class TestReadChatExtractsFromConversationStructure(unittest.IsolatedAsyncioTest
         )
 
 
+class TestReadChatReturnsRidInMetadata(unittest.IsolatedAsyncioTestCase):
+    """
+    Verify that read_chat() includes the rid (reply id) in the returned
+    ModelOutput.metadata, not just the cid.
+
+    The READ_CHAT response structure has conv_turn[0] = [cid, rid]. Currently,
+    read_chat() only returns metadata=[cid], discarding the rid. This means
+    that after recovery, ChatSession.rid is not updated, and the next
+    continuation turn uses a stale rid -- causing the server to fork the
+    conversation.
+
+    This test SHOULD FAIL against the current code because read_chat()
+    returns ModelOutput(metadata=[cid]) without rid at metadata[1].
+    """
+
+    async def test_read_chat_includes_rid_in_metadata(self):
+        """
+        Given a valid READ_CHAT response where conv_turn[0] = [cid, rid],
+        read_chat() should return ModelOutput with metadata containing BOTH
+        cid and rid:
+          - metadata[0] == SAMPLE_CID
+          - metadata[1] == SAMPLE_RID
+
+        This is critical for continuation recovery: when ChatSession.metadata
+        is updated from the recovered ModelOutput, the rid (at index 1) must
+        be present so that the next turn references the correct reply.
+        """
+        client = _make_running_client()
+
+        response_text = _build_batchexecute_response(SINGLE_TURN_INNER)
+        mock_response = _make_mock_response(response_text)
+        client._batch_execute = AsyncMock(return_value=mock_response)
+
+        # Act
+        result = await client.read_chat(SAMPLE_CID)
+
+        # Precondition: result should exist and be a ModelOutput
+        self.assertIsNotNone(result, "read_chat should return a ModelOutput")
+        self.assertIsInstance(result, ModelOutput)
+
+        # Assert that metadata has at least 2 elements (cid and rid)
+        self.assertGreaterEqual(
+            len(result.metadata), 2,
+            f"ModelOutput.metadata should contain at least [cid, rid], "
+            f"but got {result.metadata!r} (length {len(result.metadata)}). "
+            f"The rid from conv_turn[0][1] is being discarded."
+        )
+
+        # Assert metadata[0] is the cid
+        self.assertEqual(
+            result.metadata[0], SAMPLE_CID,
+            "metadata[0] should be the conversation id (cid)"
+        )
+
+        # Assert metadata[1] is the rid -- THIS IS THE KEY ASSERTION
+        self.assertEqual(
+            result.metadata[1], SAMPLE_RID,
+            f"metadata[1] should be the reply id (rid) '{SAMPLE_RID}', "
+            f"but read_chat() currently only returns metadata=[cid] without rid. "
+            f"The rid is available at conv_turn[0][1] in the response but is not "
+            f"being extracted."
+        )
+
+    async def test_read_chat_rid_propagates_to_chat_session(self):
+        """
+        When a ChatSession updates its metadata from a recovered ModelOutput,
+        the rid should be set correctly. This is an integration-level check
+        that the metadata structure from read_chat() is compatible with
+        ChatSession.metadata setter.
+
+        ChatSession.metadata setter updates __metadata[i] for each non-None
+        element. With metadata=[cid, rid], both metadata[0] (cid) and
+        metadata[1] (rid) should be updated.
+        """
+        client = _make_running_client()
+
+        response_text = _build_batchexecute_response(SINGLE_TURN_INNER)
+        mock_response = _make_mock_response(response_text)
+        client._batch_execute = AsyncMock(return_value=mock_response)
+
+        # Act
+        result = await client.read_chat(SAMPLE_CID)
+        self.assertIsNotNone(result)
+
+        # Create a ChatSession and assign the recovered metadata
+        from gemini_webapi.client import ChatSession
+        chat = ChatSession.__new__(ChatSession)
+        chat._ChatSession__metadata = [
+            "c_existing_123", "r_old_rid", "", None, None, None, None, None, None, ""
+        ]
+
+        # Simulate what happens in the recovery path:
+        # ChatSession.__setattr__ triggers metadata update when last_output is set
+        chat.metadata = result.metadata
+
+        # After recovery, cid should be updated to the recovered cid
+        self.assertEqual(
+            chat.cid, SAMPLE_CID,
+            "ChatSession.cid should be updated from recovered metadata"
+        )
+
+        # After recovery, rid should be updated to the recovered rid
+        # THIS ASSERTION WILL FAIL if read_chat() doesn't include rid in metadata
+        self.assertEqual(
+            chat.rid, SAMPLE_RID,
+            f"ChatSession.rid should be updated to '{SAMPLE_RID}' from "
+            f"recovered metadata, but it was '{chat.rid}'. This means "
+            f"read_chat() did not include rid in the ModelOutput.metadata, "
+            f"so the next continuation turn will use a stale rid."
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
