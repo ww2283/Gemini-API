@@ -960,6 +960,11 @@ class GeminiClient(GemMixin):
                                 f"Queueing={is_queueing}. Retrying..."
                             )
                             await self._reset_connection()
+                            if is_queueing and not has_candidates:
+                                raise APIError(
+                                    "Gemini server is overloaded (request queued but never started processing). "
+                                    "Try again in a few minutes or use a different model."
+                                )
                             raise APIError("Response stalled (zombie stream).")
 
                 # Final flush
