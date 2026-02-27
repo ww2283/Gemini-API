@@ -439,7 +439,7 @@ class TestRetryRecoveryViaReadChat(unittest.IsolatedAsyncioTestCase):
         When the guard triggers AND read_chat() returns None (no response
         found), GeminiError should be raised -- preserving the existing
         fail-safe behavior for cases where recovery is not possible.
-        read_chat is retried 3 times with increasing delays before giving up.
+        read_chat is retried 4 times with increasing delays before giving up.
         """
         client, chat, session_state = self._setup_midstream_cid_scenario()
 
@@ -507,11 +507,10 @@ class TestContinuationRecoveryViaReadChat(unittest.IsolatedAsyncioTestCase):
     had_response_data is True), the recovery guard should fire and attempt
     read_chat() recovery -- just like it does for new conversations.
 
-    Currently this is BROKEN: the guard checks
-        session_state.get("original_cid") in ("", None)
-    which is False for continuations (original_cid is the existing cid), so
-    recovery is skipped entirely. The @running decorator then retries by
-    re-sending the prompt, creating duplicate server-side turns.
+    The guard fires for continuations when had_response_data is True,
+    indicating the server started processing our prompt before the stream
+    broke. Without this, @running would retry by re-sending the prompt,
+    creating duplicate server-side turns.
     """
 
     async def test_continuation_recovery_triggers_when_data_received(self):
@@ -528,8 +527,7 @@ class TestContinuationRecoveryViaReadChat(unittest.IsolatedAsyncioTestCase):
           5. read_chat() returns a valid ModelOutput -> yielded to caller.
 
         Expected: The recovered ModelOutput is yielded (no APIError, no
-        duplicate prompt re-send). This test SHOULD FAIL against the
-        current code because the guard condition excludes continuations.
+        duplicate prompt re-send).
         """
         from gemini_webapi.types import ModelOutput, Candidate
 

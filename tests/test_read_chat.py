@@ -156,7 +156,7 @@ class TestReadChatCallsBatchExecute(unittest.IsolatedAsyncioTestCase):
         read_chat(cid) must call _batch_execute with:
           - GRPC.READ_CHAT as the rpcid
           - A payload containing the cid and the correct structure:
-            json.dumps([cid, 1000, None, 1, [1], [4], None, 1])
+            json.dumps([cid, 10, None, 1, [0], [4], None, 1])
 
         This test mocks _batch_execute to capture its arguments and verifies
         the RPC is constructed correctly, without caring about response parsing.
@@ -341,14 +341,10 @@ class TestReadChatReturnsRidInMetadata(unittest.IsolatedAsyncioTestCase):
     Verify that read_chat() includes the rid (reply id) in the returned
     ModelOutput.metadata, not just the cid.
 
-    The READ_CHAT response structure has conv_turn[0] = [cid, rid]. Currently,
-    read_chat() only returns metadata=[cid], discarding the rid. This means
-    that after recovery, ChatSession.rid is not updated, and the next
-    continuation turn uses a stale rid -- causing the server to fork the
-    conversation.
-
-    This test SHOULD FAIL against the current code because read_chat()
-    returns ModelOutput(metadata=[cid]) without rid at metadata[1].
+    The READ_CHAT response structure has conv_turn[0] = [cid, rid].
+    Before the fix, read_chat() returned metadata=[cid] without the rid,
+    so after recovery ChatSession.rid was stale, causing conversation forks.
+    This test verifies the fix: metadata now includes [cid, rid].
     """
 
     async def test_read_chat_includes_rid_in_metadata(self):
@@ -390,13 +386,10 @@ class TestReadChatReturnsRidInMetadata(unittest.IsolatedAsyncioTestCase):
             "metadata[0] should be the conversation id (cid)"
         )
 
-        # Assert metadata[1] is the rid -- THIS IS THE KEY ASSERTION
         self.assertEqual(
             result.metadata[1], SAMPLE_RID,
-            f"metadata[1] should be the reply id (rid) '{SAMPLE_RID}', "
-            f"but read_chat() currently only returns metadata=[cid] without rid. "
-            f"The rid is available at conv_turn[0][1] in the response but is not "
-            f"being extracted."
+            f"metadata[1] should be the reply id (rid) '{SAMPLE_RID}'. "
+            f"If this fails, rid extraction from conv_turn[0][1] may have regressed."
         )
 
     async def test_read_chat_rid_propagates_to_chat_session(self):
@@ -437,15 +430,46 @@ class TestReadChatReturnsRidInMetadata(unittest.IsolatedAsyncioTestCase):
             "ChatSession.cid should be updated from recovered metadata"
         )
 
-        # After recovery, rid should be updated to the recovered rid
-        # THIS ASSERTION WILL FAIL if read_chat() doesn't include rid in metadata
+        # Verifies rid is propagated from recovered metadata (regression guard)
         self.assertEqual(
             chat.rid, SAMPLE_RID,
-            f"ChatSession.rid should be updated to '{SAMPLE_RID}' from "
-            f"recovered metadata, but it was '{chat.rid}'. This means "
-            f"read_chat() did not include rid in the ModelOutput.metadata, "
-            f"so the next continuation turn will use a stale rid."
+            f"ChatSession.rid should be '{SAMPLE_RID}' after recovery, "
+            f"but was '{chat.rid}'. rid extraction may have regressed."
         )
+
+
+class TestReadChatRidFallbackWhenMetadataNotList(unittest.IsolatedAsyncioTestCase):
+    """Verify read_chat() handles turn_metadata that is not a list (e.g., scalar cid)."""
+
+    async def test_rid_omitted_from_metadata_when_turn_metadata_is_string(self):
+        """When conv_turn[0] is a string instead of [cid, rid], rid should not
+        be included in metadata to avoid overwriting a valid existing rid."""
+        client = _make_running_client()
+
+        # Build inner with turn_metadata as a plain string instead of [cid, rid]
+        inner = [
+            [
+                [
+                    SAMPLE_CID,  # [0]: scalar metadata (not a list)
+                    None,
+                    [["What is 2+2?"]],
+                    [
+                        [_make_candidate(SAMPLE_RCID, "The answer is 4.")],
+                    ],
+                    [1771949743, 7000000],
+                ],
+            ],
+        ]
+
+        response_text = _build_batchexecute_response(inner)
+        mock_response = _make_mock_response(response_text)
+        client._batch_execute = AsyncMock(return_value=mock_response)
+
+        result = await client.read_chat(SAMPLE_CID)
+
+        self.assertIsNotNone(result)
+        # metadata should only contain cid (no rid since extraction failed)
+        self.assertEqual(result.metadata, [SAMPLE_CID])
 
 
 if __name__ == "__main__":

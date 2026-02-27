@@ -613,6 +613,8 @@ class GeminiClient(GemMixin):
             if session_state is not None:
                 if "original_cid" not in session_state:
                     session_state["original_cid"] = chat.cid if chat else None
+                # Sticky flag: once True, persists across retries so subsequent
+                # attempts know the server started processing our prompt.
                 if "had_response_data" not in session_state:
                     session_state["had_response_data"] = False
 
@@ -620,6 +622,10 @@ class GeminiClient(GemMixin):
                     session_state.get("original_cid") in ("", None)
                     or session_state.get("had_response_data")
                 ):
+                    # Recovery triggers in two cases:
+                    # 1. New conversation: cid was empty, assigned mid-stream
+                    # 2. Continuation: server started processing (had_response_data)
+                    #    before stream broke — retrying would duplicate the turn
                     # Poll read_chat with exponential backoff. Google's Pro backend
                     # needs ~50-60s to persist responses after a stream break.
                     # Budget: 30 + 45 + 60 + 90 = 225s max wait, 4 requests.
@@ -638,6 +644,8 @@ class GeminiClient(GemMixin):
                                     f"Successfully recovered response via READ_CHAT "
                                     f"(attempt {attempt}/{len(read_chat_delays)})."
                                 )
+                                if isinstance(chat, ChatSession):
+                                    chat.metadata = recovered.metadata
                                 yield recovered
                                 return
                             logger.debug(
@@ -1116,14 +1124,32 @@ class GeminiClient(GemMixin):
                 rcid = get_nested_value(candidate_data, [0], "")
                 text = get_nested_value(candidate_data, [1, 0], "")
 
+                if not text:
+                    logger.debug(
+                        f"read_chat part[{i}]: candidate has empty text, "
+                        f"rcid={rcid!r}, skipping"
+                    )
+                    continue
+
                 turn_metadata = get_nested_value(conv_turn, [0])
-                rid = get_nested_value(turn_metadata, [1], "") if isinstance(turn_metadata, list) else ""
+                if isinstance(turn_metadata, list) and len(turn_metadata) >= 2:
+                    rid = turn_metadata[1] if isinstance(turn_metadata[1], str) else ""
+                else:
+                    rid = ""
+                    logger.warning(
+                        f"read_chat({cid!r}): could not extract rid from turn_metadata "
+                        f"(type={type(turn_metadata).__name__}). "
+                        f"Next continuation turn may use a stale rid."
+                    )
+
+                # Only include rid if extracted, to avoid overwriting valid existing rid
+                metadata = [cid, rid] if rid else [cid]
 
                 logger.debug(
                     f"read_chat({cid!r}) SUCCESS: rcid={rcid!r}, rid={rid!r}, text_len={len(text)}"
                 )
                 return ModelOutput(
-                    metadata=[cid, rid],
+                    metadata=metadata,
                     candidates=[Candidate(rcid=rcid, text=text)],
                 )
 
@@ -1131,8 +1157,14 @@ class GeminiClient(GemMixin):
                 f"read_chat({cid!r}) parsed all parts but found no candidates"
             )
             return None
+        except (json.JSONDecodeError, ValueError, KeyError, IndexError) as e:
+            logger.warning(f"read_chat({cid!r}) parse error: {type(e).__name__}: {e}")
+            return None
         except Exception as e:
-            logger.warning(f"read_chat({cid!r}) failed: {type(e).__name__}: {e}")
+            logger.error(
+                f"read_chat({cid!r}) unexpected error: {type(e).__name__}: {e}",
+                exc_info=True,
+            )
             return None
 
     @running(retry=2)
