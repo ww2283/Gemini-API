@@ -439,7 +439,7 @@ class TestRetryRecoveryViaReadChat(unittest.IsolatedAsyncioTestCase):
         When the guard triggers AND read_chat() returns None (no response
         found), GeminiError should be raised -- preserving the existing
         fail-safe behavior for cases where recovery is not possible.
-        read_chat is retried 3 times with increasing delays before giving up.
+        read_chat is retried 4 times with increasing delays before giving up.
         """
         client, chat, session_state = self._setup_midstream_cid_scenario()
 
@@ -498,6 +498,174 @@ class TestRetryRecoveryViaReadChat(unittest.IsolatedAsyncioTestCase):
             "GeminiError message should mention duplicate conversation prevention "
             "even when read_chat() raises an exception.",
         )
+
+
+class TestContinuationRecoveryViaReadChat(unittest.IsolatedAsyncioTestCase):
+    """
+    When a CONTINUATION conversation (cid already set before _generate()) fails
+    mid-stream AFTER the server has started processing our prompt (i.e.,
+    had_response_data is True), the recovery guard should fire and attempt
+    read_chat() recovery -- just like it does for new conversations.
+
+    The guard fires for continuations when had_response_data is True,
+    indicating the server started processing our prompt before the stream
+    broke. Without this, @running would retry by re-sending the prompt,
+    creating duplicate server-side turns.
+    """
+
+    async def test_continuation_recovery_triggers_when_data_received(self):
+        """
+        Scenario:
+          1. ChatSession starts with cid="c_existing_123" (continuation).
+          2. First stream attempt: server starts processing (m_data received,
+             which should set had_response_data=True), then stream fails
+             with HTTP 500 -> APIError.
+          3. @running catches APIError and retries.
+          4. On retry entry: the recovery guard should detect that data was
+             received in a previous attempt (had_response_data=True) and that
+             chat.cid is truthy, triggering read_chat() recovery.
+          5. read_chat() returns a valid ModelOutput -> yielded to caller.
+
+        Expected: The recovered ModelOutput is yielded (no APIError, no
+        duplicate prompt re-send).
+        """
+        from gemini_webapi.types import ModelOutput, Candidate
+
+        client = _make_running_client()
+        chat = _make_chat_session(client, cid="c_existing_123")
+
+        session_state = {
+            "last_texts": {},
+            "last_thoughts": {},
+            "last_progress_time": time.time(),
+        }
+
+        stream_call_count = 0
+
+        def on_stream_enter():
+            """Side-effect: on the first stream entry, simulate the server
+            having started to process our prompt (m_data received) before
+            the stream broke. In production, _process_parts sets
+            session_state["had_response_data"] = True when m_data arrives."""
+            nonlocal stream_call_count
+            stream_call_count += 1
+            if stream_call_count == 1:
+                # Simulate that response data was received before failure.
+                # This flag is the key signal that distinguishes "server
+                # started processing" from "immediate HTTP 500".
+                session_state["had_response_data"] = True
+
+        client.client.stream = _make_fail_stream(
+            status_code=500, on_enter=on_stream_enter
+        )
+
+        # Construct a realistic recovered ModelOutput
+        recovered_candidate = Candidate(
+            rcid="rc_recovered_cont",
+            text="Recovered continuation response.",
+        )
+        recovered_output = ModelOutput(
+            metadata=["c_existing_123", "r_new_rid_456", "rc_recovered_cont"],
+            candidates=[recovered_candidate],
+        )
+        client.read_chat = AsyncMock(return_value=recovered_output)
+
+        outputs = []
+        with patch("gemini_webapi.utils.decorators.DELAY_FACTOR", 0), \
+             patch("gemini_webapi.client.asyncio.sleep", new_callable=AsyncMock):
+            async for output in client._generate(
+                prompt="continue the conversation",
+                chat=chat,
+                session_state=session_state,
+            ):
+                outputs.append(output)
+
+        # Recovery via read_chat should have been called
+        client.read_chat.assert_awaited_once_with("c_existing_123")
+
+        # The recovered ModelOutput should be yielded
+        self.assertTrue(
+            any(o is recovered_output for o in outputs),
+            "The recovered ModelOutput from read_chat() should be yielded "
+            "for continuation conversations, but it was not found in the "
+            "outputs. This indicates the recovery guard did not fire for "
+            "continuations (the bug).",
+        )
+
+        # Stream should only be entered once -- recovery on retry prevents
+        # re-sending the prompt
+        self.assertEqual(
+            stream_call_count, 1,
+            "Stream should only be entered once. The retry should trigger "
+            "read_chat() recovery instead of re-sending the prompt.",
+        )
+
+
+class TestContinuationZombieRetriesNormally(unittest.IsolatedAsyncioTestCase):
+    """
+    Regression guard: when a continuation conversation gets an immediate
+    HTTP 500 (no data received, had_response_data never set to True), the
+    recovery guard should NOT fire. Normal @running retries should proceed
+    until exhausted, then raise APIError.
+
+    This test verifies that the new had_response_data-based guard does not
+    incorrectly trigger recovery for immediate failures where the server
+    never started processing our prompt.
+    """
+
+    async def test_continuation_zombie_retries_normally_no_recovery(self):
+        """
+        Scenario:
+          1. ChatSession starts with cid="c_existing_123" (continuation).
+          2. ALL stream attempts: immediate HTTP 500, no m_data received
+             (had_response_data never becomes True).
+          3. @running retries until exhausted.
+          4. APIError is raised (not GeminiError).
+
+        Expected: APIError after retries exhausted. No read_chat() calls.
+        This test should PASS with both old and new code, serving as a
+        regression guard that the new recovery logic does not over-trigger.
+        """
+        client = _make_running_client()
+        chat = _make_chat_session(client, cid="c_existing_123")
+
+        session_state = {
+            "last_texts": {},
+            "last_thoughts": {},
+            "last_progress_time": time.time(),
+        }
+
+        stream_call_count = 0
+
+        def count_stream_entries():
+            nonlocal stream_call_count
+            stream_call_count += 1
+
+        client.client.stream = _make_fail_stream(
+            status_code=500, on_enter=count_stream_entries
+        )
+
+        # read_chat should NOT be called -- mock it to detect accidental calls
+        client.read_chat = AsyncMock(return_value=None)
+
+        with patch("gemini_webapi.utils.decorators.DELAY_FACTOR", 0):
+            with self.assertRaises(APIError):
+                async for _ in client._generate(
+                    prompt="continue the conversation",
+                    chat=chat,
+                    session_state=session_state,
+                ):
+                    pass
+
+        # Multiple stream attempts should occur (normal retry behavior)
+        self.assertGreater(
+            stream_call_count, 1,
+            "Multiple stream attempts should occur when no data was received, "
+            "proving that normal retry behavior proceeded.",
+        )
+
+        # read_chat should NOT have been called (no recovery attempted)
+        client.read_chat.assert_not_awaited()
 
 
 if __name__ == "__main__":
