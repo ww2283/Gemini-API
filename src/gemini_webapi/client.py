@@ -58,6 +58,11 @@ class GeminiClient(GemMixin):
         __Secure-1PSID cookie value.
     secure_1psidts: `str`, optional
         __Secure-1PSIDTS cookie value, some Google accounts don't require this value, provide only if it's in the cookie list.
+    cookies: `dict[str, str]`, optional
+        Full Google cookie dict for browser-parity (SID, HSID, SSID, etc.).
+        Values are set on the ``.google.com`` domain. If both ``cookies``
+        and ``secure_1psid`` provide ``__Secure-1PSID``, the explicit
+        ``secure_1psid`` parameter takes precedence.
     proxy: `str`, optional
         Proxy URL.
     kwargs: `dict`, optional
@@ -122,11 +127,14 @@ class GeminiClient(GemMixin):
         self._reqid: int = random.randint(10000, 99999)
         self.kwargs = kwargs
 
-        # Full cookie dict (all Google auth cookies) for browser-parity
+        # Forward caller-supplied cookies to .google.com domain.
+        # secure_1psid/secure_1psidts below override matching keys.
         if cookies:
             for name, value in cookies.items():
                 if value:
                     self.cookies.set(name, value, domain=".google.com")
+                else:
+                    logger.debug(f"Skipping cookie {name!r} with empty value")
 
         if secure_1psid:
             self.cookies.set("__Secure-1PSID", secure_1psid, domain=".google.com")
@@ -608,8 +616,7 @@ class GeminiClient(GemMixin):
             if gem_id:
                 inner_req_list[19] = gem_id
 
-            # Browser-parity: static slots observed in browser requests
-            uuid_val = str(uuid.uuid4())
+            # Browser-parity: fixed slots observed in Chrome network traces
             inner_req_list[1] = ['en']
             inner_req_list[6] = [0]
             inner_req_list[10] = 1
@@ -620,11 +627,12 @@ class GeminiClient(GemMixin):
             inner_req_list[30] = [4]
             inner_req_list[41] = [1]
             inner_req_list[53] = 0
-            inner_req_list[59] = uuid_val
             inner_req_list[61] = []
             inner_req_list[68] = 1
 
-            # Browser-parity: dynamic x-goog-ext header with per-request UUID
+            # Per-request UUID shared between inner_req_list[59] and header
+            uuid_val = str(uuid.uuid4())
+            inner_req_list[59] = uuid_val
             request_headers = {
                 **model.model_header,
                 "x-goog-ext-525005358-jspb": f'["{uuid_val}",1]',
@@ -980,10 +988,9 @@ class GeminiClient(GemMixin):
                         yield out
                         got_update = True
 
-                    # Any data from server (parsed parts, heartbeats, queueing)
-                    # proves the stream is alive. Only declare stall when the
-                    # server goes completely silent on an open connection.
-                    if got_update or is_thinking or is_queueing or parsed_parts:
+                    # Reset watchdog when genuine progress occurs: content
+                    # yielded, model thinking, or server actively queueing.
+                    if got_update or is_thinking or is_queueing:
                         last_progress_time = time.time()
                         session_state["last_progress_time"] = last_progress_time
                     else:
