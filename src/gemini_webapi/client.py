@@ -4,6 +4,7 @@ import io
 import time
 import random
 import re
+import uuid
 from asyncio import Task
 from pathlib import Path
 from typing import Any, AsyncGenerator, Optional
@@ -600,6 +601,28 @@ class GeminiClient(GemMixin):
             if gem_id:
                 inner_req_list[19] = gem_id
 
+            # Browser-parity: static slots observed in browser requests
+            uuid_val = str(uuid.uuid4())
+            inner_req_list[1] = ['en']
+            inner_req_list[6] = [0]
+            inner_req_list[10] = 1
+            inner_req_list[11] = 0
+            inner_req_list[17] = [[0]]
+            inner_req_list[18] = 0
+            inner_req_list[27] = 1
+            inner_req_list[30] = [4]
+            inner_req_list[41] = [1]
+            inner_req_list[53] = 0
+            inner_req_list[59] = uuid_val
+            inner_req_list[61] = []
+            inner_req_list[68] = 1
+
+            # Browser-parity: dynamic x-goog-ext header with per-request UUID
+            request_headers = {
+                **model.model_header,
+                "x-goog-ext-525005358-jspb": f'["{uuid_val}",1]',
+            }
+
             request_data = {
                 "at": self.access_token,
                 "f.req": json.dumps(
@@ -669,7 +692,7 @@ class GeminiClient(GemMixin):
                 "POST",
                 Endpoint.GENERATE,
                 params=params,
-                headers=model.model_header,
+                headers=request_headers,
                 data=request_data,
                 **kwargs,
             ) as response:
