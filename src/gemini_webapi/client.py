@@ -949,7 +949,7 @@ class GeminiClient(GemMixin):
                         yield out
                         got_update = True
 
-                    if got_update or is_thinking:
+                    if got_update or is_thinking or is_queueing:
                         last_progress_time = time.time()
                         session_state["last_progress_time"] = last_progress_time
                     else:
