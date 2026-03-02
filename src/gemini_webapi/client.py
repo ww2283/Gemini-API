@@ -98,6 +98,7 @@ class GeminiClient(GemMixin):
         secure_1psid: str | None = None,
         secure_1psidts: str | None = None,
         proxy: str | None = None,
+        cookies: dict[str, str] | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -120,6 +121,12 @@ class GeminiClient(GemMixin):
         self._lock = asyncio.Lock()
         self._reqid: int = random.randint(10000, 99999)
         self.kwargs = kwargs
+
+        # Full cookie dict (all Google auth cookies) for browser-parity
+        if cookies:
+            for name, value in cookies.items():
+                if value:
+                    self.cookies.set(name, value, domain=".google.com")
 
         if secure_1psid:
             self.cookies.set("__Secure-1PSID", secure_1psid, domain=".google.com")
