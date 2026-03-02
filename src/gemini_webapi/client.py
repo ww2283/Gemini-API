@@ -718,9 +718,10 @@ class GeminiClient(GemMixin):
 
                 last_texts: dict[str, str] = session_state["last_texts"]
                 last_thoughts: dict[str, str] = session_state["last_thoughts"]
-                last_progress_time = session_state.get(
-                    "last_progress_time", time.time()
-                )
+                # Reset watchdog timer per stream attempt; stale values from
+                # previous retries would cause immediate false stall detection.
+                last_progress_time = time.time()
+                session_state["last_progress_time"] = last_progress_time
 
                 is_thinking = False
                 is_queueing = False
@@ -972,7 +973,10 @@ class GeminiClient(GemMixin):
                         yield out
                         got_update = True
 
-                    if got_update or is_thinking or is_queueing:
+                    # Any data from server (parsed parts, heartbeats, queueing)
+                    # proves the stream is alive. Only declare stall when the
+                    # server goes completely silent on an open connection.
+                    if got_update or is_thinking or is_queueing or parsed_parts:
                         last_progress_time = time.time()
                         session_state["last_progress_time"] = last_progress_time
                     else:
