@@ -26,6 +26,7 @@ from .exceptions import (
     AuthError,
     GeminiError,
     ModelInvalid,
+    ServerError,
     TemporarilyBlocked,
     TimeoutError,
     UsageLimitExceeded,
@@ -730,6 +731,13 @@ class GeminiClient(ChatMixin, GemMixin):
                                 return
                             all_stale = False
                             logger.debug(f"READ_CHAT attempt {attempt} returned None")
+                        except ServerError:
+                            all_stale = False
+                            logger.warning(
+                                f"READ_CHAT attempt {attempt}: server confirmed "
+                                f"generation failure. Skipping remaining attempts."
+                            )
+                            break
                         except Exception as e:
                             all_stale = False
                             logger.warning(

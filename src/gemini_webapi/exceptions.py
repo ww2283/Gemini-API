@@ -60,3 +60,12 @@ class TemporarilyBlocked(GeminiError):
     """
 
     pass
+
+
+class ServerError(GeminiError):
+    """
+    Exception for server-side generation failures reported via error status
+    codes in batch execute responses (e.g., gRPC INTERNAL [13]).
+    """
+
+    pass

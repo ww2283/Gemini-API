@@ -3,6 +3,7 @@ from datetime import datetime
 import orjson as json
 
 from ..constants import GRPC
+from ..exceptions import ServerError
 from ..types import Candidate, ConversationTurn, ModelOutput, RPCData
 from ..utils import extract_json_from_response, get_nested_value, logger
 
@@ -48,6 +49,20 @@ class ChatMixin:
             )
 
         for i, part in enumerate(response_json):
+            # Check for server error codes in batch execute responses.
+            # Position [5] carries error status (e.g., [13] = gRPC INTERNAL).
+            rpc_id = get_nested_value(part, [1])
+            if rpc_id in (GRPC.READ_CHAT, "hNvQHb"):
+                error_status = get_nested_value(part, [5])
+                if isinstance(error_status, list) and error_status:
+                    logger.warning(
+                        f"_fetch_chat_turns({cid!r}) server error status "
+                        f"{error_status} - generation failed server-side"
+                    )
+                    raise ServerError(
+                        f"Server returned error {error_status} for cid={cid!r}"
+                    )
+
             part_body_str = get_nested_value(part, [2])
             if not part_body_str:
                 if self.verbose:
@@ -153,6 +168,8 @@ class ChatMixin:
                 metadata=metadata,
                 candidates=[Candidate(rcid=rcid, text=text)],
             )
+        except ServerError:
+            raise
         except (json.JSONDecodeError, ValueError, KeyError, IndexError) as e:
             logger.warning(f"read_chat({cid!r}) parse error: {type(e).__name__}: {e}")
             return None
