@@ -1,6 +1,7 @@
 import asyncio
 import codecs
 import io
+import socket
 import time
 import random
 import re
@@ -10,7 +11,7 @@ from pathlib import Path
 from typing import Any, AsyncGenerator, Optional
 
 import orjson as json
-from httpx import AsyncClient, Cookies, ReadTimeout, Response
+from httpx import AsyncClient, AsyncHTTPTransport, Cookies, ReadTimeout, Response
 
 from .components import ChatMixin, GemMixin
 from .constants import (
@@ -102,6 +103,7 @@ class GeminiClient(ChatMixin, GemMixin):
         "_lock",
         "_reqid",
         "_gems",  # From GemMixin
+        "waa_token_provider",
         "kwargs",
     ]
 
@@ -111,6 +113,7 @@ class GeminiClient(ChatMixin, GemMixin):
         secure_1psidts: str | None = None,
         proxy: str | None = None,
         cookies: dict[str, str] | None = None,
+        waa_token_provider=None,
         **kwargs,
     ):
         super().__init__()
@@ -133,6 +136,7 @@ class GeminiClient(ChatMixin, GemMixin):
         self._lock = asyncio.Lock()
         self._reqid: int = random.randint(10000, 99999)
         self.kwargs = kwargs
+        self.waa_token_provider = waa_token_provider
 
         # Forward caller-supplied cookies to .google.com domain.
         # secure_1psid/secure_1psidts below override matching keys.
@@ -149,6 +153,26 @@ class GeminiClient(ChatMixin, GemMixin):
                 self.cookies.set(
                     "__Secure-1PSIDTS", secure_1psidts, domain=".google.com"
                 )
+
+    async def _get_waa_token(self) -> str | None:
+        """Obtain a WAA/BotGuard token from the configured provider."""
+        if not self.waa_token_provider:
+            return None
+        try:
+            if self.waa_token_provider is True:
+                from .utils.waa_token import harvest_waa_token
+
+                token = await harvest_waa_token(self.cookies)
+            elif callable(self.waa_token_provider):
+                token = await self.waa_token_provider(self.cookies)
+            else:
+                return None
+            if isinstance(token, str) and token.startswith("!"):
+                return token
+            return None
+        except Exception as e:
+            logger.warning(f"WAA token harvesting failed: {e}")
+            return None
 
     async def init(
         self,
@@ -200,8 +224,27 @@ class GeminiClient(ChatMixin, GemMixin):
                     )
                 )
 
-                self.client = AsyncClient(
+                # TCP keepalive to prevent idle connection termination
+                keepalive_opts: list[tuple[int, int, int]] = [
+                    (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+                ]
+                # macOS uses TCP_KEEPALIVE; Linux uses TCP_KEEPIDLE
+                if hasattr(socket, "TCP_KEEPALIVE"):
+                    keepalive_opts.append(
+                        (socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, 15)
+                    )
+                elif hasattr(socket, "TCP_KEEPIDLE"):
+                    keepalive_opts.extend([
+                        (socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 15),
+                        (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 15),
+                        (socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 4),
+                    ])
+                transport = AsyncHTTPTransport(
                     http2=True,
+                    socket_options=keepalive_opts,
+                )
+                self.client = AsyncClient(
+                    transport=transport,
                     timeout=timeout,
                     proxy=self.proxy,
                     follow_redirects=True,
@@ -572,6 +615,38 @@ class GeminiClient(ChatMixin, GemMixin):
                     if isinstance(file, io.BytesIO):
                         file.close()
 
+    async def _send_h2_ping(self) -> bool:
+        """Send HTTP/2 PING frame to keep the stream alive during extended thinking.
+
+        Accesses httpcore internals — fragile across version updates but necessary
+        because httpcore doesn't expose ping API. Returns True if ping was sent.
+        """
+        try:
+            transport = getattr(self.client, "_transport", None)
+            pool = getattr(transport, "_pool", None)
+            if pool is None:
+                return False
+            for conn in pool.connections:
+                # httpcore wraps AsyncHTTP2Connection inside AsyncHTTPConnection
+                inner = getattr(conn, "_connection", conn)
+                h2_state = getattr(inner, "_h2_state", None)
+                if h2_state is None:
+                    continue
+                write_lock = getattr(inner, "_write_lock", None)
+                net_stream = getattr(inner, "_network_stream", None)
+                if write_lock is None or net_stream is None:
+                    continue
+                async with write_lock:
+                    h2_state.ping(b"\x00" * 8)
+                    data = h2_state.data_to_send()
+                    if data:
+                        await net_stream.write(data)
+                logger.debug("Sent HTTP/2 PING frame to keep stream alive")
+                return True
+        except Exception as e:
+            logger.debug(f"HTTP/2 PING failed: {type(e).__name__}: {e}")
+            return False
+
     @running(retry=5)
     async def _generate(
         self,
@@ -604,6 +679,7 @@ class GeminiClient(ChatMixin, GemMixin):
         self._reqid += 100000
 
         gem_id = gem.id if isinstance(gem, Gem) else gem
+        ping_task = None
 
         try:
             message_content = [
@@ -648,6 +724,11 @@ class GeminiClient(ChatMixin, GemMixin):
             inner_req_list[53] = 0
             inner_req_list[61] = []
             inner_req_list[68] = 1
+
+            # WAA/BotGuard attestation token for extended stream lifetime.
+            waa_token = await self._get_waa_token()
+            if waa_token:
+                inner_req_list[3] = waa_token
 
             # Per-request UUID shared between inner_req_list[59] and header
             uuid_val = str(uuid.uuid4())
@@ -785,6 +866,18 @@ class GeminiClient(ChatMixin, GemMixin):
 
                 if self.client:
                     self.cookies.update(self.client.cookies)
+
+                # Background task to send HTTP/2 PING frames every 20s
+                # to keep the stream alive during extended model thinking.
+                async def _ping_loop():
+                    try:
+                        while True:
+                            await asyncio.sleep(20)
+                            await self._send_h2_ping()
+                    except asyncio.CancelledError:
+                        pass
+
+                ping_task = asyncio.create_task(_ping_loop())
 
                 buffer = ""
                 decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
@@ -1107,12 +1200,21 @@ class GeminiClient(ChatMixin, GemMixin):
         except (GeminiError, APIError):
             raise
         except Exception as e:
+            cause = e.__cause__ or e.__context__
             logger.warning(
-                f"Stream error: {type(e).__name__}: {e}; "
+                f"Stream error: {type(e).__name__}: {e!r}; "
+                f"cause={type(cause).__name__}: {cause!r}; "
+                f"chat.cid={getattr(chat, 'cid', None)!r}, "
+                f"model={getattr(model, 'model_name', model)!r}"
+                if cause else
+                f"Stream error: {type(e).__name__}: {e!r}; "
                 f"chat.cid={getattr(chat, 'cid', None)!r}, "
                 f"model={getattr(model, 'model_name', model)!r}"
             )
             raise APIError(f"Failed to parse response body: {e}")
+        finally:
+            if ping_task is not None:
+                ping_task.cancel()
 
     def start_chat(self, **kwargs) -> "ChatSession":
         """

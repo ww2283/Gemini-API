@@ -69,3 +69,9 @@ class ServerError(GeminiError):
     """
 
     pass
+
+
+class WAATokenError(GeminiError):
+    """WAA/BotGuard token harvesting failure. Non-retryable."""
+
+    pass

@@ -23,6 +23,7 @@ dependencies = [
     "httpx[http2]~=0.28.1",
     "loguru~=0.7.3",
     "orjson~=3.11.7",
+    "playwright>=1.40",
     "pydantic~=2.12.5",
 ]
 dynamic = ["version"]
