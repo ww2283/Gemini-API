@@ -29,17 +29,25 @@ def _cookies_for_playwright(httpx_cookies) -> list[dict]:
     """Convert httpx.Cookies to Playwright's list-of-dicts format."""
     result = []
     for cookie in httpx_cookies.jar:
-        entry = {
-            "name": cookie.name,
-            "value": cookie.value,
-            "domain": cookie.domain,
-            "path": cookie.path,
-        }
-        # Playwright requires 'url' or 'domain' — domain from the jar suffices.
-        # But domain must start with '.' for cross-subdomain cookies.
-        if entry["domain"] and not entry["domain"].startswith("."):
-            entry["domain"] = "." + entry["domain"]
-        result.append(entry)
+        name = cookie.name
+        value = cookie.value or ""
+        domain = cookie.domain or ""
+        path = cookie.path or "/"
+
+        # Skip cookies without name or domain — Playwright rejects them
+        if not name or not domain:
+            continue
+
+        # Playwright requires domain to start with '.' for cross-subdomain cookies
+        if not domain.startswith("."):
+            domain = "." + domain
+
+        result.append({
+            "name": name,
+            "value": value,
+            "domain": domain,
+            "path": path,
+        })
     return result
 
 
@@ -139,7 +147,12 @@ async def harvest_waa_token(cookies: Cookies, timeout: float = 30.0) -> str:
                     )
 
             context = await browser.new_context()
-            await context.add_cookies(pw_cookies)
+            # Add cookies one-by-one to skip any that Playwright rejects
+            for cookie in pw_cookies:
+                try:
+                    await context.add_cookies([cookie])
+                except Exception:
+                    pass  # Skip invalid cookies silently
 
             page = await context.new_page()
 
