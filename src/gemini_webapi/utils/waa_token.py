@@ -73,7 +73,7 @@ def _find_system_chrome() -> str | None:
     return None
 
 
-async def harvest_waa_token(cookies: Cookies, timeout: float = 30.0) -> str:
+async def harvest_waa_token(cookies: Cookies, timeout: float = 45.0) -> str:
     """Harvest a fresh WAA/BotGuard attestation token via Playwright.
 
     Args:
@@ -131,8 +131,10 @@ async def harvest_waa_token(cookies: Cookies, timeout: float = 30.0) -> str:
                 args=["--no-sandbox", "--disable-dev-shm-usage"],
             )
             try:
+                logger.debug("WAA harvester: launching Chrome (channel=chrome)")
                 browser = await p.chromium.launch(channel="chrome", **launch_kwargs)
-            except Exception:
+            except Exception as launch_err:
+                logger.debug(f"WAA harvester: channel=chrome failed: {launch_err}")
                 # Fallback: explicit path
                 chrome_path = _find_system_chrome()
                 if chrome_path:
@@ -159,18 +161,22 @@ async def harvest_waa_token(cookies: Cookies, timeout: float = 30.0) -> str:
             # Intercept StreamGenerate to extract the WAA token
             await page.route("**/StreamGenerate*", _handle_route)
 
-            # Navigate to Gemini
+            # Navigate to Gemini — use domcontentloaded because networkidle
+            # never fires (Gemini keeps persistent WebSocket/polling connections)
+            logger.debug("WAA harvester: navigating to gemini.google.com/app")
             await page.goto(
                 "https://gemini.google.com/app",
-                wait_until="networkidle",
+                wait_until="domcontentloaded",
                 timeout=timeout * 1000,
             )
 
             # Wait for input area
             input_sel = 'div[contenteditable="true"], textarea'
-            await page.wait_for_selector(input_sel, timeout=15000)
+            logger.debug("WAA harvester: waiting for input selector")
+            await page.wait_for_selector(input_sel, timeout=20000)
 
             # Type a trivial message and submit to trigger StreamGenerate
+            logger.debug("WAA harvester: typing prompt to trigger StreamGenerate")
             await page.click(input_sel)
             await page.type(input_sel, "hi")
             await page.keyboard.press("Enter")
