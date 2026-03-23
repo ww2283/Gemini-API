@@ -159,12 +159,7 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-.vscode/*
-!.vscode/settings.json
-!.vscode/tasks.json
-!.vscode/launch.json
-!.vscode/extensions.json
-!.vscode/*.code-snippets
+.vscode/
 
 # Local History for Visual Studio Code
 .history/
@@ -202,3 +197,7 @@ Temporary Items
 
 # Temporary files
 .temp/
+
+# Project-local overrides
+CLAUDE.md
+package_mappings.json
