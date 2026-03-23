@@ -1178,17 +1178,20 @@ class GeminiClient(ChatMixin, GemMixin):
                         yield out
                         got_update = True
 
-                    # Reset watchdog when genuine progress occurs: content
-                    # yielded, model thinking, or server actively queueing.
-                    if got_update or is_thinking or is_queueing:
+                    # Reset watchdog when data chunks actually arrive.
+                    # Previously, is_thinking/is_queueing kept resetting the
+                    # watchdog even when no new data was received, masking
+                    # zombie streams during the thinking phase.
+                    if parsed_parts or got_update:
                         last_progress_time = time.time()
                         session_state["last_progress_time"] = last_progress_time
                     else:
-                        stall_threshold = min(self.timeout, self.watchdog_timeout)
-                        if (time.time() - last_progress_time) > stall_threshold:
+                        stall_threshold = self.watchdog_timeout
+                        elapsed = time.time() - last_progress_time
+                        if elapsed > stall_threshold:
                             logger.warning(
-                                f"Response stalled (active connection but no progress for {stall_threshold}s). "
-                                f"Queueing={is_queueing}. Retrying..."
+                                f"Response stalled (no data for {elapsed:.0f}s, "
+                                f"thinking={is_thinking}, queueing={is_queueing}). Retrying..."
                             )
                             await self.reset_connection()
                             if is_queueing and not has_candidates:
