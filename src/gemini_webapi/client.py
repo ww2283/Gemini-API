@@ -755,6 +755,26 @@ class GeminiClient(ChatMixin, GemMixin):
                     session_state["original_rcid"] = (
                         chat.rcid if isinstance(chat, ChatSession) else None
                     )
+                    # Cross-session continuation: clear stale rid/rcid on the
+                    # first attempt so the server determines the append point
+                    # from cid alone.  Stale rid/rcid causes the server to
+                    # queue-and-drop the request without processing.
+                    # Only for fresh ChatSessions (last_output is None) that
+                    # carry saved metadata from a previous session.
+                    if (
+                        isinstance(chat, ChatSession)
+                        and chat.cid
+                        and chat.rid
+                        and chat.last_output is None
+                    ):
+                        logger.debug(
+                            f"Clearing stale rid/rcid for cross-session continuation "
+                            f"(cid={chat.cid!r}, rid={chat.rid!r}, rcid={chat.rcid!r})"
+                        )
+                        chat.rid = ""
+                        chat.rcid = ""
+                        # Rebuild metadata in request payload with cleared rid/rcid
+                        inner_req_list[2] = chat.metadata
                 # Sticky flag: once True, persists across retries so subsequent
                 # attempts know the server started processing our prompt.
                 if "had_response_data" not in session_state:
@@ -965,8 +985,6 @@ class GeminiClient(ChatMixin, GemMixin):
                                 m_data = get_nested_value(part_json, [1])
                                 if m_data and isinstance(chat, ChatSession):
                                     chat.metadata = m_data
-                                    if session_state is not None:
-                                        session_state["had_response_data"] = True
                                 context_str = get_nested_value(part_json, [25])
                                 if isinstance(context_str, str):
                                     is_completed = True
@@ -1138,6 +1156,8 @@ class GeminiClient(ChatMixin, GemMixin):
                                     if output_candidates:
                                         is_thinking = False
                                         is_queueing = False
+                                        if session_state is not None:
+                                            session_state["had_response_data"] = True
                                         yield ModelOutput(
                                             metadata=get_nested_value(
                                                 part_json, [1], []

@@ -111,7 +111,7 @@ class ChatMixin:
             if not turns:
                 return None
 
-            conv_turn = turns[-1]
+            conv_turn = turns[0]
             if not conv_turn:
                 logger.debug(
                     f"read_chat({cid!r}): turns[-1] is empty/None, "
