@@ -15,6 +15,8 @@ from httpx import AsyncClient, AsyncHTTPTransport, Cookies, ReadTimeout, Respons
 
 from .components import ChatMixin, GemMixin
 from .constants import (
+    DEEP_THINK_FLAG_INDEX,
+    DEEP_THINK_FLAG_VALUE,
     Endpoint,
     ErrorCode,
     GRPC,
@@ -656,6 +658,7 @@ class GeminiClient(ChatMixin, GemMixin):
         gem: Gem | str | None = None,
         chat: Optional["ChatSession"] = None,
         temporary: bool = False,
+        deep_think: bool = False,
         session_state: dict[str, Any] | None = None,
         **kwargs,
     ) -> AsyncGenerator[ModelOutput, None]:
@@ -698,7 +701,7 @@ class GeminiClient(ChatMixin, GemMixin):
             if self.session_id:
                 params["f.sid"] = self.session_id
 
-            inner_req_list: list[Any] = [None] * 69
+            inner_req_list: list[Any] = [None] * 80
             inner_req_list[0] = message_content
             inner_req_list[2] = (
                 chat.metadata
@@ -710,6 +713,8 @@ class GeminiClient(ChatMixin, GemMixin):
                 inner_req_list[19] = gem_id
             if temporary:
                 inner_req_list[TEMPORARY_CHAT_FLAG_INDEX] = 1
+            if deep_think:
+                inner_req_list[DEEP_THINK_FLAG_INDEX] = DEEP_THINK_FLAG_VALUE
 
             # Browser-parity: fixed slots observed in Chrome network traces
             inner_req_list[1] = ["en"]
