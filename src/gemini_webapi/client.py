@@ -103,6 +103,7 @@ class GeminiClient(ChatMixin, GemMixin):
         "refresh_task",
         "verbose",
         "watchdog_timeout",
+        "deep_think_poll_timeout",
         "_lock",
         "_reqid",
         "_gems",  # From GemMixin
@@ -136,6 +137,7 @@ class GeminiClient(ChatMixin, GemMixin):
         self.refresh_task: Task | None = None
         self.verbose: bool = True
         self.watchdog_timeout: float = 30  # seconds before declaring a zombie stream
+        self.deep_think_poll_timeout: float = 600  # max seconds to poll for deep think response
         self._lock = asyncio.Lock()
         self._reqid: int = random.randint(10000, 99999)
         self.kwargs = kwargs
@@ -186,6 +188,7 @@ class GeminiClient(ChatMixin, GemMixin):
         refresh_interval: float = 540,
         verbose: bool = True,
         watchdog_timeout: float = 30,  # seconds before declaring a zombie stream
+        deep_think_poll_timeout: float = 600,  # max seconds to poll for deep think
     ) -> None:
         """
         Get SNlM0e value as access token. Without this token posting will fail with 400 bad request.
@@ -209,6 +212,9 @@ class GeminiClient(ChatMixin, GemMixin):
         watchdog_timeout: `float`, optional
             Timeout in seconds for shadow retry watchdog. If no data receives from stream but connection is active,
             client will retry automatically after this duration.
+        deep_think_poll_timeout: `float`, optional
+            Max seconds to poll for deep think response. Deep think runs asynchronously on the server;
+            the client polls READ_CHAT every 15s until the response is ready. Default 600s (10 min).
         """
 
         async with self._lock:
@@ -218,6 +224,7 @@ class GeminiClient(ChatMixin, GemMixin):
             try:
                 self.verbose = verbose
                 self.watchdog_timeout = watchdog_timeout
+                self.deep_think_poll_timeout = deep_think_poll_timeout
                 access_token, build_label, session_id, valid_cookies = (
                     await get_access_token(
                         base_cookies=self.cookies,
@@ -1222,26 +1229,31 @@ class GeminiClient(ChatMixin, GemMixin):
                 # Deep think: stream returns a placeholder immediately.
                 # The real response arrives asynchronously; poll READ_CHAT.
                 if is_deep_think_pending and chat and chat.cid:
+                    poll_timeout = self.deep_think_poll_timeout
                     logger.info(
                         f"Deep think placeholder detected for cid={chat.cid!r}. "
-                        "Polling READ_CHAT for actual response..."
+                        f"Polling READ_CHAT (budget={poll_timeout}s)..."
                     )
-                    poll_delays = [10, 10, 15, 15, 20, 20, 30, 30, 30, 30]
-                    for attempt, delay in enumerate(poll_delays, 1):
-                        await asyncio.sleep(delay)
+                    poll_interval = 15  # seconds between polls
+                    elapsed = 0.0
+                    attempt = 0
+                    while elapsed < poll_timeout:
+                        await asyncio.sleep(poll_interval)
+                        elapsed += poll_interval
+                        attempt += 1
                         try:
                             recovered = await self.fetch_latest_chat_response(chat.cid)
                             if recovered and recovered.text:
-                                # Check if response still has the placeholder
                                 if DEEP_THINK_PLACEHOLDER_MARKER in recovered.text:
                                     logger.debug(
-                                        f"Deep think poll {attempt}/{len(poll_delays)}: "
+                                        f"Deep think poll {attempt} "
+                                        f"({elapsed:.0f}/{poll_timeout}s): "
                                         "still processing..."
                                     )
                                     continue
                                 logger.info(
-                                    f"Deep think response ready after poll "
-                                    f"{attempt}/{len(poll_delays)}."
+                                    f"Deep think response ready after "
+                                    f"{elapsed:.0f}s (poll {attempt})."
                                 )
                                 if isinstance(chat, ChatSession):
                                     chat.metadata = recovered.metadata
@@ -1254,7 +1266,9 @@ class GeminiClient(ChatMixin, GemMixin):
                             )
                     raise GeminiError(
                         f"Deep think response not ready after "
-                        f"~{sum(poll_delays)}s of polling for cid={chat.cid!r}."
+                        f"{poll_timeout}s of polling for cid={chat.cid!r}. "
+                        f"The response may still be processing server-side. "
+                        f"Try client.read_chat('{chat.cid}') later to retrieve it."
                     )
 
                 if not (is_completed or is_final_chunk) or is_thinking or is_queueing:
