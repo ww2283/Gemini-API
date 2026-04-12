@@ -17,6 +17,7 @@ from .components import ChatMixin, GemMixin
 from .constants import (
     DEEP_THINK_FLAG_INDEX,
     DEEP_THINK_FLAG_VALUE,
+    DEEP_THINK_PLACEHOLDER_MARKER,
     Endpoint,
     ErrorCode,
     GRPC,
@@ -927,11 +928,12 @@ class GeminiClient(ChatMixin, GemMixin):
                 has_candidates = False
                 is_completed = False
                 is_final_chunk = False
+                is_deep_think_pending = False
 
                 async def _process_parts(
                     parts: list[Any],
                 ) -> AsyncGenerator[ModelOutput, None]:
-                    nonlocal is_thinking, is_queueing, has_candidates, is_completed, is_final_chunk
+                    nonlocal is_thinking, is_queueing, has_candidates, is_completed, is_final_chunk, is_deep_think_pending
                     for part in parts:
                         # 1. Check for fatal error codes
                         error_code = get_nested_value(part, [5, 2, 0, 1, 0])
@@ -1022,6 +1024,10 @@ class GeminiClient(ChatMixin, GemMixin):
                                                 )
                                                 or text
                                             )
+
+                                        # Detect deep think placeholder before cleanup
+                                        if DEEP_THINK_PLACEHOLDER_MARKER in text:
+                                            is_deep_think_pending = True
 
                                         # Cleanup googleusercontent artifacts
                                         text = re.sub(
@@ -1212,6 +1218,44 @@ class GeminiClient(ChatMixin, GemMixin):
                     parsed_parts, _ = parse_response_by_frame(buffer)
                     async for out in _process_parts(parsed_parts):
                         yield out
+
+                # Deep think: stream returns a placeholder immediately.
+                # The real response arrives asynchronously; poll READ_CHAT.
+                if is_deep_think_pending and chat and chat.cid:
+                    logger.info(
+                        f"Deep think placeholder detected for cid={chat.cid!r}. "
+                        "Polling READ_CHAT for actual response..."
+                    )
+                    poll_delays = [10, 10, 15, 15, 20, 20, 30, 30, 30, 30]
+                    for attempt, delay in enumerate(poll_delays, 1):
+                        await asyncio.sleep(delay)
+                        try:
+                            recovered = await self.fetch_latest_chat_response(chat.cid)
+                            if recovered and recovered.text:
+                                # Check if response still has the placeholder
+                                if DEEP_THINK_PLACEHOLDER_MARKER in recovered.text:
+                                    logger.debug(
+                                        f"Deep think poll {attempt}/{len(poll_delays)}: "
+                                        "still processing..."
+                                    )
+                                    continue
+                                logger.info(
+                                    f"Deep think response ready after poll "
+                                    f"{attempt}/{len(poll_delays)}."
+                                )
+                                if isinstance(chat, ChatSession):
+                                    chat.metadata = recovered.metadata
+                                yield recovered
+                                return
+                        except Exception as e:
+                            logger.warning(
+                                f"Deep think poll {attempt} failed: "
+                                f"{type(e).__name__}: {e}"
+                            )
+                    raise GeminiError(
+                        f"Deep think response not ready after "
+                        f"~{sum(poll_delays)}s of polling for cid={chat.cid!r}."
+                    )
 
                 if not (is_completed or is_final_chunk) or is_thinking or is_queueing:
                     logger.debug(

@@ -4,6 +4,7 @@ from enum import Enum, IntEnum, StrEnum
 TEMPORARY_CHAT_FLAG_INDEX = 45
 DEEP_THINK_FLAG_INDEX = 49
 DEEP_THINK_FLAG_VALUE = 20
+DEEP_THINK_PLACEHOLDER_MARKER = "googleusercontent.com/agentic_processing_chip/"
 
 
 class Endpoint(StrEnum):
