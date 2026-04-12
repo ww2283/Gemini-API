@@ -75,3 +75,10 @@ class WAATokenError(GeminiError):
     """WAA/BotGuard token harvesting failure. Non-retryable."""
 
     pass
+
+
+class DeepThinkUnavailable(GeminiError):
+    """Deep think request failed — server returned soft failure instead of content.
+    Typically means the deep think quota is exhausted or the server couldn't process."""
+
+    pass

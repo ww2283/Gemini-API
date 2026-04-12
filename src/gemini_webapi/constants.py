@@ -5,6 +5,7 @@ TEMPORARY_CHAT_FLAG_INDEX = 45
 DEEP_THINK_FLAG_INDEX = 49
 DEEP_THINK_FLAG_VALUE = 20
 DEEP_THINK_PLACEHOLDER_MARKER = "googleusercontent.com/agentic_processing_chip/"
+DEEP_THINK_SOFT_FAILURE_MARKER = "didn't count against your Deep Think limit"
 
 
 class Endpoint(StrEnum):
@@ -34,6 +35,9 @@ class GRPC(StrEnum):
 
     # Activity methods
     BARD_ACTIVITY = "ESY5D"
+
+    # Quota methods
+    CHECK_QUOTA = "qpEbW"
 
 
 class Headers(Enum):

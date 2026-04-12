@@ -18,6 +18,7 @@ from .constants import (
     DEEP_THINK_FLAG_INDEX,
     DEEP_THINK_FLAG_VALUE,
     DEEP_THINK_PLACEHOLDER_MARKER,
+    DEEP_THINK_SOFT_FAILURE_MARKER,
     Endpoint,
     ErrorCode,
     GRPC,
@@ -28,6 +29,7 @@ from .constants import (
 from .exceptions import (
     APIError,
     AuthError,
+    DeepThinkUnavailable,
     GeminiError,
     ModelInvalid,
     ServerError,
@@ -501,6 +503,10 @@ class GeminiClient(ChatMixin, GemMixin):
                 raise GeminiError(
                     "Failed to generate contents. No output data found in response."
                 )
+
+            # Detect deep think soft failure (quota exhausted or server issue)
+            if kwargs.get("deep_think") and output.text and DEEP_THINK_SOFT_FAILURE_MARKER in output.text:
+                raise DeepThinkUnavailable(output.text.strip())
 
             if isinstance(chat, ChatSession):
                 output.metadata = chat.metadata
@@ -1301,6 +1307,74 @@ class GeminiClient(ChatMixin, GemMixin):
         finally:
             if ping_task is not None:
                 ping_task.cancel()
+
+    # Known tool triplets from qpEbW quota response
+    _QUOTA_TOOL_NAMES = {
+        (6, 6, 3): "deep_think",
+        (6, 4, 3): "pro",
+        (6, 15, 3): "flash_thinking",
+    }
+
+    async def check_quota(self) -> dict[str, dict]:
+        """
+        Query per-tool usage quotas from the server (best-effort).
+
+        Returns a dict keyed by tool name with ``remaining``, ``limit``,
+        and ``reset_timestamp`` (epoch seconds) for each tool.
+        Returns empty dict if the server doesn't provide quota data
+        (e.g., no prior StreamGenerate in this session).
+
+        Known tools:
+            - ``deep_think``: Deep Think 3.1 (10/day on Ultra)
+            - ``pro``: Gemini 3.1 Pro (500/day on Ultra)
+            - ``flash_thinking``: Flash Thinking (1,500/day on Ultra)
+
+        Example return::
+
+            {
+                "deep_think": {"remaining": 8, "limit": 10, "reset_timestamp": 1776029977},
+                "pro": {"remaining": 490, "limit": 500, "reset_timestamp": 1776029977},
+                "flash_thinking": {"remaining": 1500, "limit": 1500, "reset_timestamp": 1776029977},
+            }
+        """
+        payload = RPCData(
+            rpcid=GRPC.CHECK_QUOTA,
+            payload='[[[1,4],[6,6],[1,15]]]',
+        )
+        try:
+            response = await self._batch_execute(
+                [payload],
+                headers={
+                    "x-goog-ext-525001261-jspb": '[1,null,null,null,null,null,null,null,[4]]',
+                    "x-goog-ext-73010989-jspb": "[0]",
+                },
+            )
+        except Exception as e:
+            logger.debug(f"check_quota request failed: {e}")
+            return {}
+
+        body = response.text
+        if body.startswith(")]}'"):
+            body = body[4:]
+
+        result = {}
+        try:
+            parsed = json.loads(body.split("\n")[1])
+            data_str = parsed[0][2]
+            if data_str is None:
+                return {}
+            inner = json.loads(data_str)
+            for entry in inner[0]:
+                tool_triplet = tuple(entry[0])
+                name = self._QUOTA_TOOL_NAMES.get(tool_triplet, f"unknown_{tool_triplet}")
+                result[name] = {
+                    "remaining": entry[5],
+                    "limit": entry[4],
+                    "reset_timestamp": entry[3][0] if isinstance(entry[3], list) else None,
+                }
+        except (json.JSONDecodeError, IndexError, TypeError, KeyError) as e:
+            logger.debug(f"check_quota parse failed: {e}")
+        return result
 
     def start_chat(self, **kwargs) -> "ChatSession":
         """
