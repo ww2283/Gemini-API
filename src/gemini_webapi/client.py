@@ -825,6 +825,14 @@ class GeminiClient(ChatMixin, GemMixin):
 
             inner_req_list: list[Any] = [None] * 80
             inner_req_list[0] = message_content
+
+            # Clear stale rid/rcid that leaked from a failed stream attempt.
+            # A partially-set rid with empty cid is an inconsistent state that
+            # causes the server to reject retries.
+            if isinstance(chat, ChatSession) and not chat.cid and chat.rid:
+                chat.rid = ""
+                chat.rcid = ""
+
             inner_req_list[2] = (
                 chat.metadata
                 if chat
