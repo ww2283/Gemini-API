@@ -1,7 +1,5 @@
 import os
 import re
-import asyncio
-from asyncio import Task
 from pathlib import Path
 
 from curl_cffi.requests import AsyncSession, Cookies, Response
@@ -12,13 +10,18 @@ from .load_browser_cookies import load_browser_cookies
 from .logger import logger
 
 
-async def send_request(
-    client: AsyncSession, cookies: dict | Cookies,
-) -> tuple[Response | None, Cookies]:
-    """
-    Send http request with provided cookies using a shared session.
-    """
+def _extract_cookie_value(cookies: Cookies, name: str) -> str | None:
+    """Extract a cookie value from a curl_cffi Cookies jar."""
+    for cookie in cookies.jar:
+        if cookie.name == name:
+            return cookie.value
+    return None
 
+
+async def _try_cookies(
+    client: AsyncSession, cookies: dict | Cookies, verbose: bool = False,
+) -> tuple[str | None, str | None, str | None, Cookies] | None:
+    """Try a single cookie set. Returns (token, build_label, session_id, cookies) or None."""
     client.cookies.clear()
     if isinstance(cookies, Cookies):
         client.cookies.update(cookies)
@@ -26,16 +29,24 @@ async def send_request(
         for k, v in cookies.items():
             client.cookies.set(k, v, domain=".google.com")
 
-    response = await client.get(Endpoint.INIT, headers=Headers.GEMINI.value)
-    response.raise_for_status()
-    return response, client.cookies
+    try:
+        response = await client.get(Endpoint.INIT, headers=Headers.GEMINI.value)
+        response.raise_for_status()
+    except Exception as e:
+        if verbose:
+            logger.debug(f"Init request failed: {e}")
+        return None
 
-
-def _extract_cookie_value(cookies: Cookies, name: str) -> str | None:
-    """Extract a cookie value from a curl_cffi Cookies jar."""
-    for cookie in cookies.jar:
-        if cookie.name == name:
-            return cookie.value
+    snlm0e = re.search(r'"SNlM0e":\s*"(.*?)"', response.text)
+    cfb2h = re.search(r'"cfb2h":\s*"(.*?)"', response.text)
+    fdrfje = re.search(r'"FdrFJe":\s*"(.*?)"', response.text)
+    if snlm0e or cfb2h or fdrfje:
+        return (
+            snlm0e.group(1) if snlm0e else None,
+            cfb2h.group(1) if cfb2h else None,
+            fdrfje.group(1) if fdrfje else None,
+            client.cookies,
+        )
     return None
 
 
@@ -46,11 +57,11 @@ async def get_access_token(
     verify: bool = True,
 ) -> tuple[str | None, str | None, str | None, Cookies, AsyncSession]:
     """
-    Send a get request to gemini.google.com for each group of available cookies and return
+    Try each group of available cookies sequentially and return
     the value of "SNlM0e" as access token on the first successful request.
 
-    Returns the live AsyncSession that succeeded so the caller can reuse
-    the same TLS connection for subsequent requests.
+    Returns the live AsyncSession so the caller can reuse the same
+    TLS connection (with Chrome impersonation) for subsequent requests.
 
     Parameters
     ----------
@@ -66,7 +77,7 @@ async def get_access_token(
     Returns
     -------
     `tuple[str | None, str | None, str | None, Cookies, AsyncSession]`
-        By order: access token; build label; session id; cookies of the successful request; live session.
+        By order: access token; build label; session id; cookies; live session.
 
     Raises
     ------
@@ -87,9 +98,9 @@ async def get_access_token(
     if response and response.status_code == 200:
         extra_cookies = response.cookies
 
-    tasks = []
+    # Build list of cookie sets to try (sequentially — they share one session)
+    cookie_sets: list[tuple[str, dict | Cookies]] = []
 
-    # Base cookies passed directly on initializing client
     if isinstance(base_cookies, Cookies):
         secure_1psid = _extract_cookie_value(base_cookies, "__Secure-1PSID")
         secure_1psidts = _extract_cookie_value(base_cookies, "__Secure-1PSIDTS")
@@ -97,16 +108,17 @@ async def get_access_token(
         secure_1psid = base_cookies.get("__Secure-1PSID")
         secure_1psidts = base_cookies.get("__Secure-1PSIDTS")
 
+    # 1. Base cookies
     if secure_1psid and secure_1psidts:
         jar = Cookies(extra_cookies)
         jar.update(base_cookies)
-        tasks.append(Task(send_request(client, jar)))
+        cookie_sets.append(("base cookies", jar))
     elif verbose:
         logger.debug(
             "Skipping loading base cookies. Either __Secure-1PSID or __Secure-1PSIDTS is not provided."
         )
 
-    # Cached cookies in local file
+    # 2. Cached cookies
     cache_dir = (
         (GEMINI_COOKIE_PATH := os.getenv("GEMINI_COOKIE_PATH"))
         and Path(GEMINI_COOKIE_PATH)
@@ -122,7 +134,7 @@ async def get_access_token(
                 jar = Cookies(extra_cookies)
                 jar.update(base_cookies)
                 jar.set("__Secure-1PSIDTS", cached_1psidts, domain=".google.com")
-                tasks.append(Task(send_request(client, jar)))
+                cookie_sets.append(("cached cookies", jar))
             elif verbose:
                 logger.debug("Skipping loading cached cookies. Cache file is empty.")
         elif verbose:
@@ -137,7 +149,7 @@ async def get_access_token(
                 psid = cache_file.stem[16:]
                 jar.set("__Secure-1PSID", psid, domain=".google.com")
                 jar.set("__Secure-1PSIDTS", cached_1psidts, domain=".google.com")
-                tasks.append(Task(send_request(client, jar)))
+                cookie_sets.append((f"cached cookies ({psid[:8]}...)", jar))
                 valid_caches += 1
 
         if valid_caches == 0 and verbose:
@@ -145,19 +157,15 @@ async def get_access_token(
                 "Skipping loading cached cookies. Cookies will be cached after successful initialization."
             )
 
-    # Browser cookies (if browser-cookie3 is installed)
+    # 3. Browser cookies (if browser-cookie3 is installed)
     try:
-        valid_browser_cookies = 0
         browser_cookies = load_browser_cookies(
             domain_name="google.com", verbose=verbose
         )
         if browser_cookies:
             for browser, cookies in browser_cookies.items():
                 if browser_psid := cookies.get("__Secure-1PSID"):
-                    if (
-                        secure_1psid
-                        and secure_1psid != browser_psid
-                    ):
+                    if secure_1psid and secure_1psid != browser_psid:
                         if verbose:
                             logger.debug(
                                 f"Skipping loading local browser cookies from {browser}. "
@@ -170,15 +178,9 @@ async def get_access_token(
                         local_cookies["__Secure-1PSIDTS"] = browser_psidts
                     if nid := cookies.get("NID"):
                         local_cookies["NID"] = nid
-                    tasks.append(Task(send_request(client, local_cookies)))
-                    valid_browser_cookies += 1
+                    cookie_sets.append((f"browser ({browser})", local_cookies))
                     if verbose:
                         logger.debug(f"Loaded local browser cookies from {browser}")
-
-        if valid_browser_cookies == 0 and verbose:
-            logger.debug(
-                "Skipping loading local browser cookies. Login to gemini.google.com in your browser first."
-            )
     except ImportError:
         if verbose:
             logger.debug(
@@ -188,41 +190,28 @@ async def get_access_token(
         if verbose:
             logger.warning(f"Skipping loading local browser cookies. {e}")
 
-    if not tasks:
+    if not cookie_sets:
         raise AuthError(
             "No valid cookies available for initialization. Please pass __Secure-1PSID and __Secure-1PSIDTS manually."
         )
 
-    for i, future in enumerate(asyncio.as_completed(tasks)):
-        try:
-            response, request_cookies = await future
-            snlm0e = re.search(r'"SNlM0e":\s*"(.*?)"', response.text)
-            cfb2h = re.search(r'"cfb2h":\s*"(.*?)"', response.text)
-            fdrfje = re.search(r'"FdrFJe":\s*"(.*?)"', response.text)
-            if snlm0e or cfb2h or fdrfje:
-                if verbose:
-                    logger.debug(
-                        f"Init attempt ({i + 1}/{len(tasks)}) succeeded. Initializing client..."
-                    )
-                return (
-                    snlm0e.group(1) if snlm0e else None,
-                    cfb2h.group(1) if cfb2h else None,
-                    fdrfje.group(1) if fdrfje else None,
-                    request_cookies,
-                    client,
-                )
-            elif verbose:
-                logger.debug(
-                    f"Init attempt ({i + 1}/{len(tasks)}) failed. Cookies invalid."
-                )
-        except Exception as e:
+    # Try each cookie set sequentially (shared session — cannot run concurrently)
+    for i, (source, cookies) in enumerate(cookie_sets):
+        result = await _try_cookies(client, cookies, verbose=verbose)
+        if result:
             if verbose:
                 logger.debug(
-                    f"Init attempt ({i + 1}/{len(tasks)}) failed with error: {e}"
+                    f"Init attempt ({i + 1}/{len(cookie_sets)}) succeeded via {source}. Initializing client..."
                 )
+            access_token, build_label, session_id, valid_cookies = result
+            return access_token, build_label, session_id, valid_cookies, client
+        elif verbose:
+            logger.debug(
+                f"Init attempt ({i + 1}/{len(cookie_sets)}) via {source} failed. Cookies invalid."
+            )
 
     await client.close()
     raise AuthError(
         "Failed to initialize client. SECURE_1PSIDTS could get expired frequently, please make sure cookie values are up to date. "
-        f"(Failed initialization attempts: {len(tasks)})"
+        f"(Failed initialization attempts: {len(cookie_sets)})"
     )
