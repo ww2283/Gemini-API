@@ -130,6 +130,7 @@ class GeminiClient(ChatMixin, GemMixin):
         self.access_token: str | None = None
         self.build_label: str | None = None
         self.session_id: str | None = None
+        self._discovered_model_ids: dict[str, list[str]] = {}
         self.timeout: float = 300
         self.auto_close: bool = False
         self.close_delay: float = 300
@@ -163,7 +164,8 @@ class GeminiClient(ChatMixin, GemMixin):
 
     async def _get_waa_token(self) -> str | None:
         """Obtain a WAA/BotGuard token from the configured provider.
-        Also captures browser version for header matching."""
+        Also captures browser version for header matching and discovers
+        current model IDs from the Gemini page."""
         if not self.waa_token_provider:
             return None
         try:
@@ -172,7 +174,12 @@ class GeminiClient(ChatMixin, GemMixin):
 
                 result = await harvest_waa_token(self.cookies)
                 if isinstance(result, tuple):
-                    token, browser_version = result
+                    if len(result) == 3:
+                        token, browser_version, model_ids = result
+                        if model_ids:
+                            self._discovered_model_ids = model_ids
+                    else:
+                        token, browser_version = result
                     if browser_version:
                         self._chrome_version = browser_version
                 else:
@@ -200,6 +207,87 @@ class GeminiClient(ChatMixin, GemMixin):
             "Sec-Ch-Ua-Full-Version": f'"{version}"',
             "Sec-Ch-Ua-Full-Version-List": f'"Chromium";v="{version}", "Not-A.Brand";v="24.0.0.0", "Google Chrome";v="{version}"',
         }
+
+    @property
+    def discovered_model_ids(self) -> dict[str, list[str]]:
+        """Model ID arrays discovered from the Gemini page.
+
+        Keys are model types (``"pro"``, ``"flash"``, ``"thinking"``).
+        Values are ordered lists of model IDs available for the
+        authenticated account.  Populated after the first WAA harvest.
+        """
+        return self._discovered_model_ids
+
+    # Map Model enum names to discovery keys
+    _MODEL_TYPE_MAP: dict[str, str] = {
+        "gemini-3.1-pro": "pro",
+        "gemini-3.0-flash": "flash",
+        "gemini-3.0-flash-thinking": "thinking",
+    }
+
+    def _resolve_model_header(
+        self, model: "Model", target_variant: int | None = None,
+    ) -> dict[str, str]:
+        """Return model headers with the model ID resolved from discovery.
+
+        Resolution strategy (requires ``_discovered_model_ids``):
+
+        1. If *target_variant* is provided, select the model ID for that
+           tier from the discovered array (last for highest, first for
+           lowest) and rewrite both ID and variant in the header.
+        2. Otherwise, if the header's current ID is absent from the
+           discovered array (completely stale), replace with the last
+           entry.
+        3. If discovery data is unavailable, return headers unchanged.
+        """
+        header = dict(model.model_header)
+        jspb_key = "x-goog-ext-525001261-jspb"
+        jspb = header.get(jspb_key)
+        if not jspb or not self._discovered_model_ids:
+            return header
+
+        model_type = self._MODEL_TYPE_MAP.get(model.model_name)
+        if not model_type:
+            return header
+
+        discovered = self._discovered_model_ids.get(model_type)
+        if not discovered:
+            return header
+
+        try:
+            parsed = json.loads(jspb)
+            current_id = parsed[4]
+            current_variant = parsed[11]
+
+            if target_variant is not None and target_variant != current_variant:
+                # Caller requests a specific tier — pick from discovered array.
+                # Heuristic: highest variant → last ID, lower → earlier IDs.
+                if target_variant >= len(discovered):
+                    new_id = discovered[-1]
+                else:
+                    new_id = discovered[max(0, target_variant - 1)]
+                parsed[4] = new_id
+                parsed[11] = target_variant
+                header[jspb_key] = json.dumps(parsed).decode("utf-8")
+                logger.info(
+                    f"Resolved {model_type} model for variant {target_variant}: "
+                    f"{current_id} -> {new_id}"
+                )
+            elif current_id not in discovered:
+                # Completely stale — replace with last in array
+                new_id = discovered[-1]
+                new_variant = len(discovered)
+                parsed[4] = new_id
+                parsed[11] = new_variant
+                header[jspb_key] = json.dumps(parsed).decode("utf-8")
+                logger.info(
+                    f"Auto-updated stale {model_type} model ID: "
+                    f"{current_id} -> {new_id} (variant {new_variant})"
+                )
+        except Exception as e:
+            logger.debug(f"Model ID resolution failed: {e}")
+
+        return header
 
     async def init(
         self,
@@ -769,11 +857,14 @@ class GeminiClient(ChatMixin, GemMixin):
             if waa_token:
                 inner_req_list[3] = waa_token
 
+            # Pop library-internal kwargs before they leak to httpx
+            target_variant = kwargs.pop("target_variant", None)
+
             # Per-request UUID shared between inner_req_list[59] and header
             uuid_val = str(uuid.uuid4())
             inner_req_list[59] = uuid_val
             request_headers = {
-                **model.model_header,
+                **self._resolve_model_header(model, target_variant=target_variant),
                 **self._build_chrome_headers(),
                 "x-goog-ext-525005358-jspb": f'["{uuid_val}",1]',
             }

@@ -5,6 +5,9 @@ Launches headless Chrome, loads the Gemini page to trigger BotGuard attestation,
 types a trivial prompt to trigger StreamGenerate, intercepts the request to extract
 the attestation token from inner_req_list[3], then aborts the request.
 
+Also extracts model ID arrays from the page's embedded experiment data, enabling
+dynamic discovery of current model IDs (which Google rotates periodically).
+
 The token is ~1.3KB, starts with '!', is single-use, and has a 3-5 minute TTL.
 It is validated only at stream connection establishment.
 """
@@ -14,12 +17,48 @@ from __future__ import annotations
 import asyncio
 import json
 import platform
+import re
 import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs
 
 from loguru import logger
+
+# RPC names embedded in Gemini's server-side experiment data that contain
+# model ID arrays.  These map each "mode" (Fast / Thinking / Pro) to an
+# ordered list of model IDs — one per tier/variant.
+_MODEL_DISCOVERY_RPCS: dict[str, str] = {
+    "pro": "g9Ghwf",
+    "flash": "xjRbsb",
+    "thinking": "G1FaEb",
+}
+
+
+def _extract_model_ids_from_html(html: str) -> dict[str, list[str]]:
+    """Extract model ID arrays from Gemini page HTML.
+
+    The page embeds experiment/feature-flag data containing arrays of hex
+    model IDs keyed by RPC name.  Format in HTML (after escaping)::
+
+        "rpc_name",["\\"[[\\\\\\\"id1\\\\\\\",\\\\\\\"id2\\\\\\\"]]\\""]]
+
+    Returns a dict like ``{"pro": ["id1", "id2", ...], ...}``.
+    """
+    result: dict[str, list[str]] = {}
+    for model_type, rpc_name in _MODEL_DISCOVERY_RPCS.items():
+        # Find the RPC entry and its payload containing the model ID array
+        # Pattern: "rpc_name",[" ... [[\"id1\",\"id2\"]] ... "]
+        pattern = re.escape(f'\\"{rpc_name}\\"') + r',\[.+?\[\[(.+?)\]\]'
+        match = re.search(pattern, html)
+        if not match:
+            continue
+        # Extract hex model IDs from the matched group
+        ids = re.findall(r'[0-9a-f]{16}', match.group(1))
+        if ids:
+            result[model_type] = ids
+            logger.debug(f"Discovered {model_type} model IDs: {ids}")
+    return result
 
 if TYPE_CHECKING:
     from httpx import Cookies
@@ -176,6 +215,15 @@ async def harvest_waa_token(cookies: Cookies, timeout: float = 45.0) -> str:
             logger.debug("WAA harvester: waiting for input selector")
             await page.wait_for_selector(input_sel, timeout=20000)
 
+            # Extract model IDs from page HTML before triggering the request.
+            # The page embeds experiment data with model ID arrays per mode.
+            model_ids: dict[str, list[str]] = {}
+            try:
+                html = await page.content()
+                model_ids = _extract_model_ids_from_html(html)
+            except Exception as e:
+                logger.debug(f"WAA harvester: model ID extraction failed: {e}")
+
             # Type a trivial message and submit to trigger StreamGenerate
             logger.debug("WAA harvester: typing prompt to trigger StreamGenerate")
             await page.click(input_sel)
@@ -193,7 +241,15 @@ async def harvest_waa_token(cookies: Cookies, timeout: float = 45.0) -> str:
 
             browser_version = browser.version if browser else None
             logger.debug(f"WAA token harvested ({len(token)} chars, Chrome {browser_version})")
-            return token, browser_version
+
+            # Clean up routes before closing to avoid TargetClosedError noise
+            # from in-flight requests that haven't been handled yet.
+            try:
+                await page.unroute_all(behavior="ignoreErrors")
+            except Exception:
+                pass
+
+            return token, browser_version, model_ids
 
     except WAATokenError:
         raise

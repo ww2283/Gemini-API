@@ -79,7 +79,7 @@ class Model(Enum):
     G_3_1_PRO = (
         "gemini-3.1-pro",
         {
-            "x-goog-ext-525001261-jspb": '[1,null,null,null,"e6fa609c3fa255c0",null,null,0,[4],null,null,2]',
+            "x-goog-ext-525001261-jspb": '[1,null,null,null,"797f3d0293f288ad",null,null,0,[4],null,null,3]',
             "x-goog-ext-73010989-jspb": "[0]",
             "x-goog-ext-73010990-jspb": "[0]",
         },
