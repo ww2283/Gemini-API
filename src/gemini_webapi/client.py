@@ -162,14 +162,21 @@ class GeminiClient(ChatMixin, GemMixin):
                 )
 
     async def _get_waa_token(self) -> str | None:
-        """Obtain a WAA/BotGuard token from the configured provider."""
+        """Obtain a WAA/BotGuard token from the configured provider.
+        Also captures browser version for header matching."""
         if not self.waa_token_provider:
             return None
         try:
             if self.waa_token_provider is True:
                 from .utils.waa_token import harvest_waa_token
 
-                token = await harvest_waa_token(self.cookies)
+                result = await harvest_waa_token(self.cookies)
+                if isinstance(result, tuple):
+                    token, browser_version = result
+                    if browser_version:
+                        self._chrome_version = browser_version
+                else:
+                    token = result
             elif callable(self.waa_token_provider):
                 token = await self.waa_token_provider(self.cookies)
             else:
@@ -180,6 +187,19 @@ class GeminiClient(ChatMixin, GemMixin):
         except Exception as e:
             logger.warning(f"WAA token harvesting failed: {e}")
             return None
+
+    def _build_chrome_headers(self) -> dict[str, str]:
+        """Build sec-ch-ua headers matching the actual Chrome version."""
+        version = getattr(self, "_chrome_version", None)
+        if not version:
+            return {}
+        major = version.split(".")[0]
+        return {
+            "User-Agent": f"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{version} Safari/537.36",
+            "Sec-Ch-Ua": f'"Chromium";v="{major}", "Not-A.Brand";v="24", "Google Chrome";v="{major}"',
+            "Sec-Ch-Ua-Full-Version": f'"{version}"',
+            "Sec-Ch-Ua-Full-Version-List": f'"Chromium";v="{version}", "Not-A.Brand";v="24.0.0.0", "Google Chrome";v="{version}"',
+        }
 
     async def init(
         self,
@@ -754,6 +774,7 @@ class GeminiClient(ChatMixin, GemMixin):
             inner_req_list[59] = uuid_val
             request_headers = {
                 **model.model_header,
+                **self._build_chrome_headers(),
                 "x-goog-ext-525005358-jspb": f'["{uuid_val}",1]',
             }
 

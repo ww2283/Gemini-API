@@ -81,7 +81,8 @@ async def harvest_waa_token(cookies: Cookies, timeout: float = 45.0) -> str:
         timeout: Maximum time in seconds to wait for token extraction.
 
     Returns:
-        The WAA token string (starts with '!', ~1.3KB).
+        Tuple of (token, browser_version) where token starts with '!' (~1.3KB)
+        and browser_version is e.g. '146.0.7680.178'.
 
     Raises:
         WAATokenError: If token harvesting fails for any reason.
@@ -190,8 +191,9 @@ async def harvest_waa_token(cookies: Cookies, timeout: float = 45.0) -> str:
             if not token:
                 raise WAATokenError("StreamGenerate request not intercepted or token missing")
 
-            logger.debug(f"WAA token harvested ({len(token)} chars)")
-            return token
+            browser_version = browser.version if browser else None
+            logger.debug(f"WAA token harvested ({len(token)} chars, Chrome {browser_version})")
+            return token, browser_version
 
     except WAATokenError:
         raise
