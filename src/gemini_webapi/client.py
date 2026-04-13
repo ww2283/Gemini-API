@@ -843,7 +843,7 @@ class GeminiClient(ChatMixin, GemMixin):
             inner_req_list[6] = [0]
             inner_req_list[10] = 1
             inner_req_list[11] = 0
-            inner_req_list[17] = [[0]]
+            inner_req_list[17] = [[1]]
             inner_req_list[18] = 0
             inner_req_list[27] = 1
             inner_req_list[30] = [4]
