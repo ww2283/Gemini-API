@@ -162,19 +162,28 @@ class GeminiClient(ChatMixin, GemMixin):
                     "__Secure-1PSIDTS", secure_1psidts, domain=".google.com"
                 )
 
-    async def _get_waa_token(self) -> str | None:
-        """Obtain a WAA/BotGuard token from the configured provider.
+    async def _get_waa_token(self) -> tuple[str | None, str | None]:
+        """Obtain a WAA/BotGuard token and paired hash from the configured provider.
         Also captures browser version for header matching and discovers
-        current model IDs from the Gemini page."""
+        current model IDs from the Gemini page.
+
+        Returns:
+            Tuple of (waa_token, botguard_hash). Either or both may be None.
+        """
         if not self.waa_token_provider:
-            return None
+            return None, None
         try:
+            botguard_hash = None
             if self.waa_token_provider is True:
                 from .utils.waa_token import harvest_waa_token
 
                 result = await harvest_waa_token(self.cookies)
                 if isinstance(result, tuple):
-                    if len(result) == 3:
+                    if len(result) == 4:
+                        token, browser_version, model_ids, botguard_hash = result
+                        if model_ids:
+                            self._discovered_model_ids = model_ids
+                    elif len(result) == 3:
                         token, browser_version, model_ids = result
                         if model_ids:
                             self._discovered_model_ids = model_ids
@@ -187,13 +196,13 @@ class GeminiClient(ChatMixin, GemMixin):
             elif callable(self.waa_token_provider):
                 token = await self.waa_token_provider(self.cookies)
             else:
-                return None
+                return None, None
             if isinstance(token, str) and token.startswith("!"):
-                return token
-            return None
+                return token, botguard_hash
+            return None, None
         except Exception as e:
             logger.warning(f"WAA token harvesting failed: {e}")
-            return None
+            return None, None
 
     def _build_chrome_headers(self) -> dict[str, str]:
         """Build sec-ch-ua headers matching the actual Chrome version."""
@@ -268,6 +277,10 @@ class GeminiClient(ChatMixin, GemMixin):
                     new_id = discovered[max(0, target_variant - 1)]
                 parsed[4] = new_id
                 parsed[11] = target_variant
+                # Ensure jspb has 15 elements with variant at position 14
+                while len(parsed) < 15:
+                    parsed.append(None)
+                parsed[14] = target_variant
                 header[jspb_key] = json.dumps(parsed).decode("utf-8")
                 logger.info(
                     f"Resolved {model_type} model for variant {target_variant}: "
@@ -791,14 +804,13 @@ class GeminiClient(ChatMixin, GemMixin):
             inner_req_list[6] = [0]
             inner_req_list[10] = 1
             inner_req_list[11] = 0
-            inner_req_list[17] = [[1]]
+            inner_req_list[17] = [[0]]
             inner_req_list[18] = 0
             inner_req_list[27] = 1
             inner_req_list[30] = [4]
             inner_req_list[41] = [1]
             inner_req_list[53] = 0
             inner_req_list[61] = []
-            inner_req_list[67] = 0
             inner_req_list[68] = 1
             # Slot 79: model variant extracted from jspb header (position 11)
             jspb_str = model.model_header.get("x-goog-ext-525001261-jspb", "")
@@ -808,10 +820,12 @@ class GeminiClient(ChatMixin, GemMixin):
                 except Exception:
                     pass
 
-            # WAA/BotGuard attestation token for extended stream lifetime.
-            waa_token = await self._get_waa_token()
+            # WAA/BotGuard attestation token + paired hash for extended stream lifetime.
+            waa_token, botguard_hash = await self._get_waa_token()
             if waa_token:
                 inner_req_list[3] = waa_token
+            if botguard_hash:
+                inner_req_list[4] = botguard_hash
 
             # Pop library-internal kwargs before they leak to curl_cffi
             target_variant = kwargs.pop("target_variant", None)

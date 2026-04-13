@@ -118,7 +118,7 @@ class TestGetWaaTokenNoneProvider(unittest.IsolatedAsyncioTestCase):
 
         result = await client._get_waa_token()
 
-        self.assertIsNone(result)
+        self.assertEqual(result, (None, None))
 
 
 class TestGetWaaTokenCallableProvider(unittest.IsolatedAsyncioTestCase):
@@ -145,7 +145,7 @@ class TestGetWaaTokenCallableProvider(unittest.IsolatedAsyncioTestCase):
         # Provider should have been called exactly once with the client's cookies
         mock_provider.assert_awaited_once_with(client.cookies)
         # Return value should be the token from the provider
-        self.assertEqual(result, fake_token)
+        self.assertEqual(result, (fake_token, None))
 
 
 class TestGetWaaTokenValidatesFormat(unittest.IsolatedAsyncioTestCase):
@@ -170,10 +170,10 @@ class TestGetWaaTokenValidatesFormat(unittest.IsolatedAsyncioTestCase):
         # The provider was called (it's a valid callable)
         mock_provider.assert_awaited_once()
         # But the return value is rejected because it doesn't start with '!'
-        self.assertIsNone(
-            result,
+        self.assertEqual(
+            result, (None, None),
             "Token not starting with '!' should be rejected. "
-            "_get_waa_token must return None for invalid token format.",
+            "_get_waa_token must return (None, None) for invalid token format.",
         )
 
     async def test_rejects_non_string_token(self):
@@ -188,8 +188,8 @@ class TestGetWaaTokenValidatesFormat(unittest.IsolatedAsyncioTestCase):
 
         result = await client._get_waa_token()
 
-        self.assertIsNone(
-            result,
+        self.assertEqual(
+            result, (None, None),
             "Non-string return from provider should be rejected.",
         )
 
@@ -218,10 +218,10 @@ class TestGetWaaTokenExceptionHandling(unittest.IsolatedAsyncioTestCase):
         result = await client._get_waa_token()
 
         mock_provider.assert_awaited_once()
-        self.assertIsNone(
-            result,
+        self.assertEqual(
+            result, (None, None),
             "Provider exception should be caught. _get_waa_token must return "
-            "None on failure, not propagate the exception.",
+            "(None, None) on failure, not propagate the exception.",
         )
 
 
@@ -359,7 +359,7 @@ class TestTokenInjectedIntoGenerateRequest(unittest.IsolatedAsyncioTestCase):
 
         expected_token = "!test_token_abc"
 
-        with patch.object(client, "_get_waa_token", new_callable=AsyncMock, return_value=expected_token):
+        with patch.object(client, "_get_waa_token", new_callable=AsyncMock, return_value=(expected_token, "fakehash123")):
             try:
                 async for _ in client._generate(
                     prompt="hello",
@@ -411,7 +411,7 @@ class TestNoTokenWhenProviderIsNone(unittest.IsolatedAsyncioTestCase):
         client.client.stream = mock_stream
         client.client.cookies = Cookies()
 
-        with patch.object(client, "_get_waa_token", new_callable=AsyncMock, return_value=None):
+        with patch.object(client, "_get_waa_token", new_callable=AsyncMock, return_value=(None, None)):
             try:
                 async for _ in client._generate(
                     prompt="hello",
@@ -458,7 +458,7 @@ class TestGenerateCallsGetWaaToken(unittest.IsolatedAsyncioTestCase):
         client.client.stream = mock_stream
         client.client.cookies = Cookies()
 
-        mock_get_waa = AsyncMock(return_value="!fresh_token_xyz")
+        mock_get_waa = AsyncMock(return_value=("!fresh_token_xyz", "hash456"))
 
         with patch.object(client, "_get_waa_token", mock_get_waa):
             try:

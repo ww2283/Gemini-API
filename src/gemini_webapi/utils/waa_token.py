@@ -141,10 +141,11 @@ async def harvest_waa_token(cookies: Cookies, timeout: float = 45.0) -> str:
         raise WAATokenError("No cookies available for WAA token harvesting")
 
     token: str | None = None
+    botguard_hash: str | None = None
     token_event = asyncio.Event()
 
     async def _handle_route(route):
-        nonlocal token
+        nonlocal token, botguard_hash
         try:
             request = route.request
             post_data = request.post_data
@@ -157,6 +158,9 @@ async def harvest_waa_token(cookies: Cookies, timeout: float = 45.0) -> str:
                     candidate = inner[3]
                     if isinstance(candidate, str) and candidate.startswith("!"):
                         token = candidate
+                        # Position [4] is a BotGuard hash paired with the token
+                        if len(inner) > 4 and isinstance(inner[4], str):
+                            botguard_hash = inner[4]
                         token_event.set()
         except Exception:
             pass
@@ -240,7 +244,10 @@ async def harvest_waa_token(cookies: Cookies, timeout: float = 45.0) -> str:
                 raise WAATokenError("StreamGenerate request not intercepted or token missing")
 
             browser_version = browser.version if browser else None
-            logger.debug(f"WAA token harvested ({len(token)} chars, Chrome {browser_version})")
+            logger.debug(
+                f"WAA token harvested ({len(token)} chars, "
+                f"hash={'yes' if botguard_hash else 'no'}, Chrome {browser_version})"
+            )
 
             # Clean up routes before closing to avoid TargetClosedError noise
             # from in-flight requests that haven't been handled yet.
@@ -249,7 +256,7 @@ async def harvest_waa_token(cookies: Cookies, timeout: float = 45.0) -> str:
             except Exception:
                 pass
 
-            return token, browser_version, model_ids
+            return token, browser_version, model_ids, botguard_hash
 
     except WAATokenError:
         raise

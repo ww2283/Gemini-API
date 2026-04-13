@@ -79,7 +79,7 @@ class Model(Enum):
     G_3_1_PRO = (
         "gemini-3.1-pro",
         {
-            "x-goog-ext-525001261-jspb": '[1,null,null,null,"797f3d0293f288ad",null,null,0,[4],null,null,3]',
+            "x-goog-ext-525001261-jspb": '[1,null,null,null,"797f3d0293f288ad",null,null,0,[4],null,null,3,null,null,3]',
             "x-goog-ext-73010989-jspb": "[0]",
             "x-goog-ext-73010990-jspb": "[0]",
         },
@@ -88,7 +88,7 @@ class Model(Enum):
     G_3_0_FLASH = (
         "gemini-3.0-flash",
         {
-            "x-goog-ext-525001261-jspb": '[1,null,null,null,"fbb127bbb056c959",null,null,0,[4],null,null,1]',
+            "x-goog-ext-525001261-jspb": '[1,null,null,null,"fbb127bbb056c959",null,null,0,[4],null,null,1,null,null,1]',
             "x-goog-ext-73010989-jspb": "[0]",
             "x-goog-ext-73010990-jspb": "[0]",
         },
@@ -97,7 +97,7 @@ class Model(Enum):
     G_3_0_FLASH_THINKING = (
         "gemini-3.0-flash-thinking",
         {
-            "x-goog-ext-525001261-jspb": '[1,null,null,null,"5bf011840784117a",null,null,0,[4],null,null,1]',
+            "x-goog-ext-525001261-jspb": '[1,null,null,null,"5bf011840784117a",null,null,0,[4],null,null,1,null,null,1]',
             "x-goog-ext-73010989-jspb": "[0]",
             "x-goog-ext-73010990-jspb": "[0]",
         },

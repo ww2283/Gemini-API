@@ -155,7 +155,7 @@ class TestDeepThinkFlagInjected(unittest.IsolatedAsyncioTestCase):
 
         # Stub _get_waa_token so the WAA path doesn't interfere
         with patch.object(
-            client, "_get_waa_token", new_callable=AsyncMock, return_value=None
+            client, "_get_waa_token", new_callable=AsyncMock, return_value=(None, None)
         ):
             try:
                 async for _ in client._generate(
@@ -220,7 +220,7 @@ class TestDeepThinkFlagNotSetByDefault(unittest.IsolatedAsyncioTestCase):
         client.client.cookies = Cookies()
 
         with patch.object(
-            client, "_get_waa_token", new_callable=AsyncMock, return_value=None
+            client, "_get_waa_token", new_callable=AsyncMock, return_value=(None, None)
         ):
             try:
                 async for _ in client._generate(
@@ -259,7 +259,7 @@ class TestDeepThinkFlagNotSetByDefault(unittest.IsolatedAsyncioTestCase):
         client.client.cookies = Cookies()
 
         with patch.object(
-            client, "_get_waa_token", new_callable=AsyncMock, return_value=None
+            client, "_get_waa_token", new_callable=AsyncMock, return_value=(None, None)
         ):
             try:
                 async for _ in client._generate(
@@ -317,7 +317,7 @@ class TestInnerReqListLength(unittest.IsolatedAsyncioTestCase):
         client.client.cookies = Cookies()
 
         with patch.object(
-            client, "_get_waa_token", new_callable=AsyncMock, return_value=None
+            client, "_get_waa_token", new_callable=AsyncMock, return_value=(None, None)
         ):
             try:
                 async for _ in client._generate(
@@ -357,7 +357,7 @@ class TestInnerReqListLength(unittest.IsolatedAsyncioTestCase):
         client.client.cookies = Cookies()
 
         with patch.object(
-            client, "_get_waa_token", new_callable=AsyncMock, return_value=None
+            client, "_get_waa_token", new_callable=AsyncMock, return_value=(None, None)
         ):
             try:
                 async for _ in client._generate(
@@ -459,7 +459,7 @@ class TestGenerateContentForwardsDeepThink(unittest.IsolatedAsyncioTestCase):
         client, mock_stream = _make_public_api_client()
 
         with patch.object(
-            client, "_get_waa_token", new_callable=AsyncMock, return_value=None
+            client, "_get_waa_token", new_callable=AsyncMock, return_value=(None, None)
         ):
             try:
                 await client.generate_content(
@@ -498,7 +498,7 @@ class TestGenerateContentForwardsDeepThink(unittest.IsolatedAsyncioTestCase):
         client, mock_stream = _make_public_api_client()
 
         with patch.object(
-            client, "_get_waa_token", new_callable=AsyncMock, return_value=None
+            client, "_get_waa_token", new_callable=AsyncMock, return_value=(None, None)
         ):
             try:
                 await client.generate_content(
@@ -555,7 +555,7 @@ class TestSendMessageForwardsDeepThink(unittest.IsolatedAsyncioTestCase):
         chat = client.start_chat(model=Model.UNSPECIFIED)
 
         with patch.object(
-            client, "_get_waa_token", new_callable=AsyncMock, return_value=None
+            client, "_get_waa_token", new_callable=AsyncMock, return_value=(None, None)
         ):
             try:
                 await chat.send_message(
@@ -593,7 +593,7 @@ class TestSendMessageForwardsDeepThink(unittest.IsolatedAsyncioTestCase):
         chat = client.start_chat(model=Model.UNSPECIFIED)
 
         with patch.object(
-            client, "_get_waa_token", new_callable=AsyncMock, return_value=None
+            client, "_get_waa_token", new_callable=AsyncMock, return_value=(None, None)
         ):
             try:
                 await chat.send_message(prompt="Hi there")
@@ -645,7 +645,7 @@ class TestGenerateContentStreamForwardsDeepThink(unittest.IsolatedAsyncioTestCas
         client, mock_stream = _make_public_api_client()
 
         with patch.object(
-            client, "_get_waa_token", new_callable=AsyncMock, return_value=None
+            client, "_get_waa_token", new_callable=AsyncMock, return_value=(None, None)
         ):
             try:
                 async for _ in client.generate_content_stream(
@@ -684,7 +684,7 @@ class TestGenerateContentStreamForwardsDeepThink(unittest.IsolatedAsyncioTestCas
         client, mock_stream = _make_public_api_client()
 
         with patch.object(
-            client, "_get_waa_token", new_callable=AsyncMock, return_value=None
+            client, "_get_waa_token", new_callable=AsyncMock, return_value=(None, None)
         ):
             try:
                 async for _ in client.generate_content_stream(
@@ -738,7 +738,7 @@ class TestSendMessageStreamForwardsDeepThink(unittest.IsolatedAsyncioTestCase):
         chat = client.start_chat(model=Model.UNSPECIFIED)
 
         with patch.object(
-            client, "_get_waa_token", new_callable=AsyncMock, return_value=None
+            client, "_get_waa_token", new_callable=AsyncMock, return_value=(None, None)
         ):
             try:
                 async for _ in chat.send_message_stream(
