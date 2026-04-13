@@ -3,7 +3,8 @@ from pathlib import Path
 from datetime import datetime
 from typing import Any
 
-from httpx import AsyncClient, Cookies, HTTPError
+from curl_cffi.requests import AsyncSession, Cookies
+from curl_cffi.requests.exceptions import HTTPError
 from pydantic import BaseModel, field_validator
 
 from ..utils import logger
@@ -81,8 +82,8 @@ class Image(BaseModel):
             if skip_invalid_filename:
                 return None
 
-        async with AsyncClient(
-            http2=True, follow_redirects=True, cookies=cookies, proxy=self.proxy
+        async with AsyncSession(
+            impersonate="chrome", allow_redirects=True, cookies=cookies, proxy=self.proxy
         ) as client:
             response = await client.get(self.url)
             if response.status_code == 200:
@@ -104,7 +105,7 @@ class Image(BaseModel):
                 return str(dest.resolve())
             else:
                 raise HTTPError(
-                    f"Error downloading image: {response.status_code} {response.reason_phrase}"
+                    f"Error downloading image: {response.status_code}"
                 )
 
 

@@ -1,7 +1,6 @@
 import asyncio
 import codecs
 import io
-import socket
 import time
 import random
 import re
@@ -11,7 +10,8 @@ from pathlib import Path
 from typing import Any, AsyncGenerator, Optional
 
 import orjson as json
-from httpx import AsyncClient, AsyncHTTPTransport, Cookies, ReadTimeout, Response
+from curl_cffi.requests import AsyncSession, Cookies, Response
+from curl_cffi.requests.exceptions import ReadTimeout
 
 from .components import ChatMixin, GemMixin
 from .constants import (
@@ -60,7 +60,7 @@ from .utils import (
 
 class GeminiClient(ChatMixin, GemMixin):
     """
-    Async httpx client interface for gemini.google.com.
+    Async client interface for gemini.google.com.
 
     `secure_1psid` must be provided unless the optional dependency `browser-cookie3` is installed, and
     you have logged in to google.com in your local browser.
@@ -80,7 +80,7 @@ class GeminiClient(ChatMixin, GemMixin):
         Proxy URL.
     kwargs: `dict`, optional
         Additional arguments which will be passed to the http client.
-        Refer to `httpx.AsyncClient` for more information.
+        Refer to `curl_cffi.requests.AsyncSession` for more information.
 
     Raises
     ------
@@ -126,7 +126,7 @@ class GeminiClient(ChatMixin, GemMixin):
         self.cookies = Cookies()
         self.proxy = proxy
         self._running: bool = False
-        self.client: AsyncClient | None = None
+        self.client: AsyncSession | None = None
         self.access_token: str | None = None
         self.build_label: str | None = None
         self.session_id: str | None = None
@@ -335,7 +335,7 @@ class GeminiClient(ChatMixin, GemMixin):
                 self.verbose = verbose
                 self.watchdog_timeout = watchdog_timeout
                 self.deep_think_poll_timeout = deep_think_poll_timeout
-                access_token, build_label, session_id, valid_cookies = (
+                access_token, build_label, session_id, valid_cookies, session = (
                     await get_access_token(
                         base_cookies=self.cookies,
                         proxy=self.proxy,
@@ -344,34 +344,8 @@ class GeminiClient(ChatMixin, GemMixin):
                     )
                 )
 
-                # TCP keepalive to prevent idle connection termination
-                keepalive_opts: list[tuple[int, int, int]] = [
-                    (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
-                ]
-                # macOS uses TCP_KEEPALIVE; Linux uses TCP_KEEPIDLE
-                if hasattr(socket, "TCP_KEEPALIVE"):
-                    keepalive_opts.append(
-                        (socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, 15)
-                    )
-                elif hasattr(socket, "TCP_KEEPIDLE"):
-                    keepalive_opts.extend([
-                        (socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 15),
-                        (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 15),
-                        (socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 4),
-                    ])
-                transport = AsyncHTTPTransport(
-                    http2=True,
-                    socket_options=keepalive_opts,
-                )
-                self.client = AsyncClient(
-                    transport=transport,
-                    timeout=timeout,
-                    proxy=self.proxy,
-                    follow_redirects=True,
-                    headers=Headers.GEMINI.value,
-                    cookies=valid_cookies,
-                    **self.kwargs,
-                )
+                session.timeout = timeout
+                self.client = session
                 self.access_token = access_token
                 self.cookies = valid_cookies
                 self.build_label = build_label
@@ -424,7 +398,7 @@ class GeminiClient(ChatMixin, GemMixin):
             self.refresh_task = None
 
         if self.client:
-            await self.client.aclose()
+            await self.client.close()
 
     async def reset_connection(self) -> None:
         """
@@ -435,16 +409,15 @@ class GeminiClient(ChatMixin, GemMixin):
         unnecessary round-trip to gemini.google.com/app on every retry.
         """
         if self.client:
-            await self.client.aclose()
+            await self.client.close()
 
-        self.client = AsyncClient(
-            http2=True,
+        self.client = AsyncSession(
+            impersonate="chrome",
             timeout=self.timeout,
             proxy=self.proxy,
-            follow_redirects=True,
+            allow_redirects=True,
             headers=Headers.GEMINI.value,
             cookies=self.cookies,
-            **self.kwargs,
         )
 
     async def reset_close_task(self) -> None:
@@ -475,7 +448,7 @@ class GeminiClient(ChatMixin, GemMixin):
                 async with self._lock:
                     # Refresh all cookies in the background to keep the session alive.
                     new_1psidts, rotated_cookies = await rotate_1psidts(
-                        self.cookies, self.proxy
+                        self.client, verbose=self.verbose,
                     )
                     if rotated_cookies:
                         self.cookies.update(rotated_cookies)
@@ -534,7 +507,7 @@ class GeminiClient(ChatMixin, GemMixin):
             If set to `True`, the ongoing conversation will not show up in Gemini history.
         kwargs: `dict`, optional
             Additional arguments which will be passed to the post request.
-            Refer to `httpx.AsyncClient.request` for more information.
+            Refer to `curl_cffi.requests.AsyncSession` for more information.
 
         Returns
         -------
@@ -660,7 +633,7 @@ class GeminiClient(ChatMixin, GemMixin):
         temporary: `bool`, optional
             If set to `True`, the ongoing conversation will not show up in Gemini history.
         kwargs: `dict`, optional
-            Additional arguments passed to `httpx.AsyncClient.stream`.
+            Additional arguments passed to `curl_cffi.requests.AsyncSession.stream`.
 
         Yields
         ------
@@ -739,38 +712,6 @@ class GeminiClient(ChatMixin, GemMixin):
                     if isinstance(file, io.BytesIO):
                         file.close()
 
-    async def _send_h2_ping(self) -> bool:
-        """Send HTTP/2 PING frame to keep the stream alive during extended thinking.
-
-        Accesses httpcore internals — fragile across version updates but necessary
-        because httpcore doesn't expose ping API. Returns True if ping was sent.
-        """
-        try:
-            transport = getattr(self.client, "_transport", None)
-            pool = getattr(transport, "_pool", None)
-            if pool is None:
-                return False
-            for conn in pool.connections:
-                # httpcore wraps AsyncHTTP2Connection inside AsyncHTTPConnection
-                inner = getattr(conn, "_connection", conn)
-                h2_state = getattr(inner, "_h2_state", None)
-                if h2_state is None:
-                    continue
-                write_lock = getattr(inner, "_write_lock", None)
-                net_stream = getattr(inner, "_network_stream", None)
-                if write_lock is None or net_stream is None:
-                    continue
-                async with write_lock:
-                    h2_state.ping(b"\x00" * 8)
-                    data = h2_state.data_to_send()
-                    if data:
-                        await net_stream.write(data)
-                logger.debug("Sent HTTP/2 PING frame to keep stream alive")
-                return True
-        except Exception as e:
-            logger.debug(f"HTTP/2 PING failed: {type(e).__name__}: {e}")
-            return False
-
     @running(retry=5)
     async def _generate(
         self,
@@ -804,7 +745,6 @@ class GeminiClient(ChatMixin, GemMixin):
         self._reqid += 100000
 
         gem_id = gem.id if isinstance(gem, Gem) else gem
-        ping_task = None
 
         try:
             message_content = [
@@ -873,7 +813,7 @@ class GeminiClient(ChatMixin, GemMixin):
             if waa_token:
                 inner_req_list[3] = waa_token
 
-            # Pop library-internal kwargs before they leak to httpx
+            # Pop library-internal kwargs before they leak to curl_cffi
             target_variant = kwargs.pop("target_variant", None)
 
             # Per-request UUID shared between inner_req_list[59] and header
@@ -1033,18 +973,6 @@ class GeminiClient(ChatMixin, GemMixin):
 
                 if self.client:
                     self.cookies.update(self.client.cookies)
-
-                # Background task to send HTTP/2 PING frames every 20s
-                # to keep the stream alive during extended model thinking.
-                async def _ping_loop():
-                    try:
-                        while True:
-                            await asyncio.sleep(20)
-                            await self._send_h2_ping()
-                    except asyncio.CancelledError:
-                        pass
-
-                ping_task = asyncio.create_task(_ping_loop())
 
                 buffer = ""
                 decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
@@ -1319,7 +1247,7 @@ class GeminiClient(ChatMixin, GemMixin):
                             except json.JSONDecodeError:
                                 continue
 
-                async for chunk in response.aiter_bytes():
+                async for chunk in response.aiter_content():
                     buffer += decoder.decode(chunk, final=False)
                     if buffer.startswith(")]}'"):
                         buffer = buffer[4:].lstrip()
@@ -1433,8 +1361,7 @@ class GeminiClient(ChatMixin, GemMixin):
             )
             raise APIError(f"Failed to parse response body: {e}")
         finally:
-            if ping_task is not None:
-                ping_task.cancel()
+            pass
 
     # Known tool triplets from qpEbW quota response
     _QUOTA_TOOL_NAMES = {
@@ -1533,11 +1460,11 @@ class GeminiClient(ChatMixin, GemMixin):
             List of `gemini_webapi.types.RPCData` objects to be executed.
         kwargs: `dict`, optional
             Additional arguments which will be passed to the post request.
-            Refer to `httpx.AsyncClient.request` for more information.
+            Refer to `curl_cffi.requests.AsyncSession` for more information.
 
         Returns
         -------
-        :class:`httpx.Response`
+        :class:`curl_cffi.requests.Response`
             Response object containing the result of the batch execution.
         """
 
@@ -1592,7 +1519,7 @@ class ChatSession:
     Parameters
     ----------
     geminiclient: `GeminiClient`
-        Async httpx client interface for gemini.google.com.
+        Async client interface for gemini.google.com.
     metadata: `list[str]`, optional
         List of chat metadata `[cid, rid, rcid]`, can be shorter than 3 elements, like `[cid, rid]` or `[cid]` only.
     cid: `str`, optional
@@ -1689,7 +1616,7 @@ class ChatSession:
             and create a new chat session under the hood.
         kwargs: `dict`, optional
             Additional arguments which will be passed to the post request.
-            Refer to `httpx.AsyncClient.request` for more information.
+            Refer to `curl_cffi.requests.AsyncSession` for more information.
 
         Returns
         -------

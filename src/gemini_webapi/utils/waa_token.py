@@ -61,11 +61,11 @@ def _extract_model_ids_from_html(html: str) -> dict[str, list[str]]:
     return result
 
 if TYPE_CHECKING:
-    from httpx import Cookies
+    from curl_cffi.requests import Cookies
 
 
 def _cookies_for_playwright(httpx_cookies) -> list[dict]:
-    """Convert httpx.Cookies to Playwright's list-of-dicts format."""
+    """Convert curl_cffi.requests.Cookies to Playwright's list-of-dicts format."""
     result = []
     for cookie in httpx_cookies.jar:
         name = cookie.name

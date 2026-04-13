@@ -4,7 +4,7 @@ import asyncio
 from asyncio import Task
 from pathlib import Path
 
-from httpx import AsyncClient, Cookies, Response
+from curl_cffi.requests import AsyncSession, Cookies, Response
 
 from ..constants import Endpoint, Headers
 from ..exceptions import AuthError
@@ -13,22 +13,30 @@ from .logger import logger
 
 
 async def send_request(
-    cookies: dict | Cookies, proxy: str | None = None
+    client: AsyncSession, cookies: dict | Cookies,
 ) -> tuple[Response | None, Cookies]:
     """
-    Send http request with provided cookies.
+    Send http request with provided cookies using a shared session.
     """
 
-    async with AsyncClient(
-        http2=True,
-        proxy=proxy,
-        headers=Headers.GEMINI.value,
-        cookies=cookies,
-        follow_redirects=True,
-    ) as client:
-        response = await client.get(Endpoint.INIT)
-        response.raise_for_status()
-        return response, client.cookies
+    client.cookies.clear()
+    if isinstance(cookies, Cookies):
+        client.cookies.update(cookies)
+    else:
+        for k, v in cookies.items():
+            client.cookies.set(k, v, domain=".google.com")
+
+    response = await client.get(Endpoint.INIT, headers=Headers.GEMINI.value)
+    response.raise_for_status()
+    return response, client.cookies
+
+
+def _extract_cookie_value(cookies: Cookies, name: str) -> str | None:
+    """Extract a cookie value from a curl_cffi Cookies jar."""
+    for cookie in cookies.jar:
+        if cookie.name == name:
+            return cookie.value
+    return None
 
 
 async def get_access_token(
@@ -36,19 +44,17 @@ async def get_access_token(
     proxy: str | None = None,
     verbose: bool = False,
     verify: bool = True,
-) -> tuple[str, Cookies, str | None, str | None]:
+) -> tuple[str | None, str | None, str | None, Cookies, AsyncSession]:
     """
     Send a get request to gemini.google.com for each group of available cookies and return
     the value of "SNlM0e" as access token on the first successful request.
 
-    Possible cookie sources:
-    - Base cookies passed to the function.
-    - __Secure-1PSID from base cookies with __Secure-1PSIDTS from cache.
-    - Local browser cookies (if optional dependency `browser-cookie3` is installed).
+    Returns the live AsyncSession that succeeded so the caller can reuse
+    the same TLS connection for subsequent requests.
 
     Parameters
     ----------
-    base_cookies : `dict | httpx.Cookies`
+    base_cookies : `dict | curl_cffi.requests.Cookies`
         Base cookies to be used in the request.
     proxy: `str`, optional
         Proxy URL.
@@ -59,8 +65,8 @@ async def get_access_token(
 
     Returns
     -------
-    `tuple[str, str | None, str | None, Cookies]`
-        By order: access token; build label; session id; cookies of the successful request.
+    `tuple[str | None, str | None, str | None, Cookies, AsyncSession]`
+        By order: access token; build label; session id; cookies of the successful request; live session.
 
     Raises
     ------
@@ -68,23 +74,33 @@ async def get_access_token(
         If all requests failed.
     """
 
-    async with AsyncClient(
-        http2=True, proxy=proxy, follow_redirects=True, verify=verify
-    ) as client:
+    client = AsyncSession(
+        impersonate="chrome", proxy=proxy, allow_redirects=True, verify=verify
+    )
+
+    try:
         response = await client.get(Endpoint.GOOGLE)
+    except Exception:
+        response = None
 
     extra_cookies = Cookies()
-    if response.status_code == 200:
+    if response and response.status_code == 200:
         extra_cookies = response.cookies
 
     tasks = []
 
     # Base cookies passed directly on initializing client
-    # We use a Jar to merge extra_cookies and base_cookies safely (preserving domains)
-    if "__Secure-1PSID" in base_cookies and "__Secure-1PSIDTS" in base_cookies:
+    if isinstance(base_cookies, Cookies):
+        secure_1psid = _extract_cookie_value(base_cookies, "__Secure-1PSID")
+        secure_1psidts = _extract_cookie_value(base_cookies, "__Secure-1PSIDTS")
+    else:
+        secure_1psid = base_cookies.get("__Secure-1PSID")
+        secure_1psidts = base_cookies.get("__Secure-1PSIDTS")
+
+    if secure_1psid and secure_1psidts:
         jar = Cookies(extra_cookies)
         jar.update(base_cookies)
-        tasks.append(Task(send_request(jar, proxy=proxy)))
+        tasks.append(Task(send_request(client, jar)))
     elif verbose:
         logger.debug(
             "Skipping loading base cookies. Either __Secure-1PSID or __Secure-1PSIDTS is not provided."
@@ -97,14 +113,6 @@ async def get_access_token(
         or (Path(__file__).parent / "temp")
     )
 
-    # Safely get __Secure-1PSID value
-    if isinstance(base_cookies, Cookies):
-        secure_1psid = base_cookies.get(
-            "__Secure-1PSID", domain=".google.com"
-        ) or base_cookies.get("__Secure-1PSID")
-    else:
-        secure_1psid = base_cookies.get("__Secure-1PSID")
-
     if secure_1psid:
         filename = f".cached_1psidts_{secure_1psid}.txt"
         cache_file = cache_dir / filename
@@ -114,7 +122,7 @@ async def get_access_token(
                 jar = Cookies(extra_cookies)
                 jar.update(base_cookies)
                 jar.set("__Secure-1PSIDTS", cached_1psidts, domain=".google.com")
-                tasks.append(Task(send_request(jar, proxy=proxy)))
+                tasks.append(Task(send_request(client, jar)))
             elif verbose:
                 logger.debug("Skipping loading cached cookies. Cache file is empty.")
         elif verbose:
@@ -129,7 +137,7 @@ async def get_access_token(
                 psid = cache_file.stem[16:]
                 jar.set("__Secure-1PSID", psid, domain=".google.com")
                 jar.set("__Secure-1PSIDTS", cached_1psidts, domain=".google.com")
-                tasks.append(Task(send_request(jar, proxy=proxy)))
+                tasks.append(Task(send_request(client, jar)))
                 valid_caches += 1
 
         if valid_caches == 0 and verbose:
@@ -145,10 +153,10 @@ async def get_access_token(
         )
         if browser_cookies:
             for browser, cookies in browser_cookies.items():
-                if secure_1psid := cookies.get("__Secure-1PSID"):
+                if browser_psid := cookies.get("__Secure-1PSID"):
                     if (
-                        "__Secure-1PSID" in base_cookies
-                        and base_cookies["__Secure-1PSID"] != secure_1psid
+                        secure_1psid
+                        and secure_1psid != browser_psid
                     ):
                         if verbose:
                             logger.debug(
@@ -157,12 +165,12 @@ async def get_access_token(
                             )
                         continue
 
-                    local_cookies = {"__Secure-1PSID": secure_1psid}
-                    if secure_1psidts := cookies.get("__Secure-1PSIDTS"):
-                        local_cookies["__Secure-1PSIDTS"] = secure_1psidts
+                    local_cookies = {"__Secure-1PSID": browser_psid}
+                    if browser_psidts := cookies.get("__Secure-1PSIDTS"):
+                        local_cookies["__Secure-1PSIDTS"] = browser_psidts
                     if nid := cookies.get("NID"):
                         local_cookies["NID"] = nid
-                    tasks.append(Task(send_request(local_cookies, proxy=proxy)))
+                    tasks.append(Task(send_request(client, local_cookies)))
                     valid_browser_cookies += 1
                     if verbose:
                         logger.debug(f"Loaded local browser cookies from {browser}")
@@ -201,6 +209,7 @@ async def get_access_token(
                     cfb2h.group(1) if cfb2h else None,
                     fdrfje.group(1) if fdrfje else None,
                     request_cookies,
+                    client,
                 )
             elif verbose:
                 logger.debug(
@@ -212,6 +221,7 @@ async def get_access_token(
                     f"Init attempt ({i + 1}/{len(tasks)}) failed with error: {e}"
                 )
 
+    await client.close()
     raise AuthError(
         "Failed to initialize client. SECURE_1PSIDTS could get expired frequently, please make sure cookie values are up to date. "
         f"(Failed initialization attempts: {len(tasks)})"

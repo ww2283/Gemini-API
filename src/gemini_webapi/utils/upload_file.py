@@ -1,8 +1,10 @@
 import io
+import mimetypes
 import random
 from pathlib import Path
 
-from httpx import AsyncClient
+from curl_cffi import CurlMime
+from curl_cffi.requests import AsyncSession
 from pydantic import ConfigDict, validate_call
 
 from ..constants import Endpoint, Headers
@@ -38,11 +40,10 @@ async def upload_file(
     -------
     `str`
         Identifier of the uploaded file.
-        E.g. "/contrib_service/ttl_1d/1709764705i7wdlyx3mdzndme3a767pluckv4flj"
 
     Raises
     ------
-    `httpx.HTTPStatusError`
+    `curl_cffi.requests.exceptions.HTTPError`
         If the upload request failed.
     """
 
@@ -64,12 +65,21 @@ async def upload_file(
     else:
         raise ValueError(f"Unsupported file type: {type(file)}")
 
-    async with AsyncClient(http2=True, proxy=proxy) as client:
+    content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+
+    mime_part = CurlMime()
+    mime_part.addpart(
+        name="file",
+        filename=filename,
+        content_type=content_type,
+        data=file_content,
+    )
+
+    async with AsyncSession(impersonate="chrome", proxy=proxy) as client:
         response = await client.post(
             url=Endpoint.UPLOAD,
             headers=Headers.UPLOAD.value,
-            files={"file": (filename, file_content)},
-            follow_redirects=True,
+            multipart=mime_part,
         )
         response.raise_for_status()
         return response.text

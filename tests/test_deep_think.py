@@ -22,7 +22,7 @@ from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import orjson as json
-from httpx import Cookies
+from curl_cffi.requests import Cookies
 
 from gemini_webapi.exceptions import GeminiError as _GE
 
@@ -89,7 +89,7 @@ def _make_stream_mock():
         raise _StreamAbort("bail out of _generate")
         yield  # pragma: no cover  -- makes this an async generator
 
-    response.aiter_bytes = _abort_iter
+    response.aiter_content = _abort_iter
 
     @asynccontextmanager
     async def _stream_cm(*args, **kwargs):
