@@ -5,7 +5,10 @@ TEMPORARY_CHAT_FLAG_INDEX = 45
 DEEP_THINK_FLAG_INDEX = 49
 DEEP_THINK_FLAG_VALUE = 20
 DEEP_THINK_PLACEHOLDER_MARKER = "googleusercontent.com/agentic_processing_chip/"
-DEEP_THINK_SOFT_FAILURE_MARKER = "didn't count against your Deep Think limit"
+DEEP_THINK_SOFT_FAILURE_MARKERS: tuple[str, ...] = (
+    "didn't count against your Deep Think limit",  # quota exhausted
+    "A lot of people are using Deep Think",  # server capacity exhausted
+)
 
 
 class Endpoint(StrEnum):

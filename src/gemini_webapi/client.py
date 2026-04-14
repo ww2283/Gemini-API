@@ -18,7 +18,7 @@ from .constants import (
     DEEP_THINK_FLAG_INDEX,
     DEEP_THINK_FLAG_VALUE,
     DEEP_THINK_PLACEHOLDER_MARKER,
-    DEEP_THINK_SOFT_FAILURE_MARKER,
+    DEEP_THINK_SOFT_FAILURE_MARKERS,
     Endpoint,
     ErrorCode,
     GRPC,
@@ -106,6 +106,8 @@ class GeminiClient(ChatMixin, GemMixin):
         "verbose",
         "watchdog_timeout",
         "deep_think_poll_timeout",
+        "read_chat_delays",
+        "deep_think_soft_failure_markers",
         "_lock",
         "_reqid",
         "_gems",  # From GemMixin
@@ -141,6 +143,10 @@ class GeminiClient(ChatMixin, GemMixin):
         self.verbose: bool = True
         self.watchdog_timeout: float = 30  # seconds before declaring a zombie stream
         self.deep_think_poll_timeout: float = 600  # max seconds to poll for deep think response
+        self.read_chat_delays: list[float] = [30, 45, 60, 90]
+        self.deep_think_soft_failure_markers: list[str] = list(
+            DEEP_THINK_SOFT_FAILURE_MARKERS
+        )
         self._lock = asyncio.Lock()
         self._reqid: int = random.randint(10000, 99999)
         self.kwargs = kwargs
@@ -312,6 +318,8 @@ class GeminiClient(ChatMixin, GemMixin):
         verbose: bool = True,
         watchdog_timeout: float = 30,  # seconds before declaring a zombie stream
         deep_think_poll_timeout: float = 600,  # max seconds to poll for deep think
+        read_chat_delays: list[float] | None = None,
+        deep_think_soft_failure_markers: list[str] | None = None,
     ) -> None:
         """
         Get SNlM0e value as access token. Without this token posting will fail with 400 bad request.
@@ -338,6 +346,18 @@ class GeminiClient(ChatMixin, GemMixin):
         deep_think_poll_timeout: `float`, optional
             Max seconds to poll for deep think response. Deep think runs asynchronously on the server;
             the client polls READ_CHAT every 15s until the response is ready. Default 600s (10 min).
+        read_chat_delays: `list[float]`, optional
+            Recovery polling budget used when a stream breaks after `cid` was assigned or the
+            server began processing. Each value is the number of seconds to sleep before the
+            next `fetch_latest_chat_response(cid)` attempt. Total recovery window equals the
+            sum. Default `[30, 45, 60, 90]` (~225s, 4 attempts). Raise for workloads where
+            complex Pro requests with attachments legitimately take minutes to materialize.
+        deep_think_soft_failure_markers: `list[str]`, optional
+            Substrings that, when found in a deep think response, indicate the server returned
+            a canned UI failure message (e.g. quota exhausted, capacity exhausted) instead of
+            real reasoning output. Matching responses raise `DeepThinkUnavailable`. Default
+            covers the two known English variants; extend here to cover future wording
+            changes or localized variants without forking the library.
         """
 
         async with self._lock:
@@ -348,6 +368,12 @@ class GeminiClient(ChatMixin, GemMixin):
                 self.verbose = verbose
                 self.watchdog_timeout = watchdog_timeout
                 self.deep_think_poll_timeout = deep_think_poll_timeout
+                if read_chat_delays is not None:
+                    self.read_chat_delays = list(read_chat_delays)
+                if deep_think_soft_failure_markers is not None:
+                    self.deep_think_soft_failure_markers = list(
+                        deep_think_soft_failure_markers
+                    )
                 access_token, build_label, session_id, valid_cookies, session = (
                     await get_access_token(
                         base_cookies=self.cookies,
@@ -598,8 +624,15 @@ class GeminiClient(ChatMixin, GemMixin):
                     "Failed to generate contents. No output data found in response."
                 )
 
-            # Detect deep think soft failure (quota exhausted or server issue)
-            if kwargs.get("deep_think") and output.text and DEEP_THINK_SOFT_FAILURE_MARKER in output.text:
+            # Detect deep think soft failure (quota exhausted, server capacity, etc.)
+            if (
+                kwargs.get("deep_think")
+                and output.text
+                and any(
+                    marker in output.text
+                    for marker in self.deep_think_soft_failure_markers
+                )
+            ):
                 raise DeepThinkUnavailable(output.text.strip())
 
             if isinstance(chat, ChatSession):
@@ -894,9 +927,10 @@ class GeminiClient(ChatMixin, GemMixin):
                     # 2. Continuation: server started processing (had_response_data)
                     #    before stream broke — retrying would duplicate the turn
                     # Poll read_chat with exponential backoff. Google's Pro backend
-                    # needs ~50-60s to persist responses after a stream break.
-                    # Budget: 30 + 45 + 60 + 90 = 225s max wait, 4 requests.
-                    read_chat_delays = [30, 45, 60, 90]
+                    # needs ~50-60s to persist responses after a stream break;
+                    # complex Pro + attachments can take much longer. Budget is
+                    # configurable via GeminiClient.read_chat_delays / init().
+                    read_chat_delays = self.read_chat_delays
                     all_stale = True  # Track if every attempt returned stale
                     for attempt, delay in enumerate(read_chat_delays, 1):
                         logger.warning(
