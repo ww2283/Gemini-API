@@ -1037,5 +1037,258 @@ class TestDiffInnerReqListNoCachedReference(unittest.TestCase):
         )
 
 
+# ---------------------------------------------------------------------------
+# Phase 3: PayloadValidationError + diagnose_model probe
+#
+# Phase 2's automated drift diff catches slot mismatches during normal
+# generate_content flow, but it's silent -- it only logs warnings.  Phase 3
+# adds an opt-in diagnostic surface:
+#
+#   1. A new `PayloadValidationError(GeminiError)` exception class that is
+#      NOT an `APIError`, so `@running`'s retry loop leaves it alone.
+#   2. `GeminiClient.diagnose_model(model_name)` runs a pro+flash probe:
+#        - target model fails with the silent-stream signature
+#        - AND flash succeeds
+#      -> raise PayloadValidationError with a hint to run
+#      `python -m gemini_webapi.diag`.
+#
+# The probe is narrow on purpose: only the specific "target broken, flash
+# fine" pattern turns into PayloadValidationError. Other failures propagate
+# unchanged so diagnose_model cannot mask unrelated outages.
+# ---------------------------------------------------------------------------
+
+
+class TestPayloadValidationErrorClass(unittest.TestCase):
+    """
+    PayloadValidationError must be a GeminiError (so `except GeminiError`
+    still catches it) but NOT an APIError (so @running won't retry it --
+    retrying a payload-drift failure is pointless; the request will keep
+    failing until the client code is fixed).
+    """
+
+    def test_payload_validation_error_is_gemini_error_not_api_error(self):
+        """
+        Contract: PayloadValidationError subclasses GeminiError and NOT
+        APIError.  This is the whole retry-policy mechanism -- any
+        GeminiError subclass that is not an APIError is surfaced to the
+        caller immediately by `@running`.
+        """
+        from gemini_webapi.exceptions import (
+            APIError,
+            GeminiError,
+            PayloadValidationError,
+        )
+
+        self.assertTrue(
+            issubclass(PayloadValidationError, GeminiError),
+            "PayloadValidationError must subclass GeminiError so users' "
+            "generic `except GeminiError` clauses still catch it.",
+        )
+        self.assertFalse(
+            issubclass(PayloadValidationError, APIError),
+            "PayloadValidationError must NOT subclass APIError -- the "
+            "@running decorator retries APIError, and retrying a payload "
+            "drift failure would just burn quota.",
+        )
+
+    def test_payload_validation_error_preserves_message(self):
+        """
+        The exception must preserve whatever message the caller passes --
+        `diagnose_model` is the caller that crafts the human-readable
+        hint (see test_diagnose_model_raises_with_diag_hint below).
+        """
+        from gemini_webapi.exceptions import PayloadValidationError
+
+        err = PayloadValidationError("custom diagnostic message")
+        self.assertIn("custom diagnostic message", str(err))
+
+
+class TestRunningDecoratorDoesNotRetryPayloadValidationError(
+    unittest.IsolatedAsyncioTestCase
+):
+    """
+    The whole reason PayloadValidationError bypasses APIError is so
+    `@running(retry=N)` surfaces it on the first attempt -- no sleeps,
+    no re-invocations.  This test pins that policy down by wrapping a
+    trivial async function with `@running(retry=5)`, having it raise
+    PayloadValidationError, and asserting:
+      - the exception propagates on the first call, AND
+      - `asyncio.sleep` is never awaited (decorator's inter-retry sleep),
+      - the wrapped function body runs exactly once.
+    """
+
+    async def test_running_decorator_does_not_retry_payload_validation_error(self):
+        """
+        Given an async function wrapped with `@running(retry=5)` that
+        raises PayloadValidationError, the decorator must NOT retry it:
+        the wrapped body runs exactly once, `asyncio.sleep` is never
+        called, and the exception propagates unchanged.
+        """
+        from gemini_webapi.exceptions import PayloadValidationError
+        from gemini_webapi.utils.decorators import running
+
+        call_count = 0
+
+        @running(retry=5)
+        async def _raises_payload_validation(client):
+            nonlocal call_count
+            call_count += 1
+            raise PayloadValidationError("drift detected in slot 67")
+
+        # Minimal client that satisfies the decorator's _running check.
+        client = MagicMock()
+        client._running = True
+
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            with self.assertRaises(PayloadValidationError) as cm:
+                await _raises_payload_validation(client)
+
+        self.assertIn("drift detected in slot 67", str(cm.exception))
+        self.assertEqual(
+            call_count, 1,
+            f"Wrapped function must run exactly once, ran {call_count} times. "
+            "The @running decorator is retrying PayloadValidationError when "
+            "it should be letting it propagate immediately.",
+        )
+        mock_sleep.assert_not_called()
+
+
+class TestDiagnoseModelRaisesWhenTargetFailsAndFlashSucceeds(
+    unittest.IsolatedAsyncioTestCase
+):
+    """
+    `diagnose_model(model_name)` is the opt-in drift probe.  When the
+    target model fails with the silent-stream-cut signature ("Stream
+    interrupted or truncated.") AND Flash succeeds in the same session,
+    the failure cannot be blamed on quota, cookies, or Google outage --
+    it's a payload-drift fingerprint.  The probe raises
+    PayloadValidationError with a pointer to the CLI diag tool.
+    """
+
+    async def test_diagnose_model_raises_with_diag_hint(self):
+        """
+        Given a client whose generate_content:
+          - raises APIError("Stream interrupted or truncated.") when the
+            target model is requested, AND
+          - returns a successful ModelOutput when Flash is requested,
+        `diagnose_model("gemini-3.1-pro")` must raise PayloadValidationError
+        whose message includes both the model name (or "pro") and the
+        `python -m gemini_webapi.diag` CLI hint.
+        """
+        from gemini_webapi.client import GeminiClient
+        from gemini_webapi.exceptions import APIError, PayloadValidationError
+
+        client = GeminiClient.__new__(GeminiClient)
+        client._running = True
+        client.verbose = False
+
+        async def _fake_generate(prompt, *, model=None, **_kw):
+            model_str = str(model).lower() if model is not None else ""
+            if "flash" in model_str:
+                result = MagicMock()
+                result.text = "ok"
+                return result
+            raise APIError("Stream interrupted or truncated.")
+
+        with patch.object(
+            client, "generate_content", new=AsyncMock(side_effect=_fake_generate)
+        ):
+            with self.assertRaises(PayloadValidationError) as cm:
+                await client.diagnose_model("gemini-3.1-pro")
+
+        msg = str(cm.exception)
+        self.assertIn(
+            "python -m gemini_webapi.diag",
+            msg,
+            f"PayloadValidationError message must point users at the diag "
+            f"CLI. Got: {msg!r}",
+        )
+        self.assertTrue(
+            "pro" in msg.lower() or "gemini-3.1-pro" in msg,
+            f"PayloadValidationError message must identify the failing "
+            f"model. Got: {msg!r}",
+        )
+
+
+class TestDiagnoseModelReturnsNoneWhenTargetSucceeds(
+    unittest.IsolatedAsyncioTestCase
+):
+    """
+    When the target model generates successfully, there is no drift to
+    diagnose -- `diagnose_model` must simply return None.  (It is the
+    caller's responsibility to decide whether to log or surface the
+    all-clear result.)
+    """
+
+    async def test_returns_none_when_target_succeeds(self):
+        """
+        Given a client whose generate_content succeeds for both Pro and
+        Flash, `diagnose_model("gemini-3.1-pro")` returns None and does
+        not raise.
+        """
+        from gemini_webapi.client import GeminiClient
+
+        client = GeminiClient.__new__(GeminiClient)
+        client._running = True
+        client.verbose = False
+
+        success = MagicMock()
+        success.text = "ok"
+
+        mock_generate = AsyncMock(return_value=success)
+
+        with patch.object(client, "generate_content", new=mock_generate):
+            result = await client.diagnose_model("gemini-3.1-pro")
+
+        self.assertIsNone(
+            result,
+            "diagnose_model must return None on the happy path -- there "
+            "is nothing to diagnose when the target model works.",
+        )
+
+
+class TestDiagnoseModelPropagatesNonMatchingErrors(
+    unittest.IsolatedAsyncioTestCase
+):
+    """
+    `diagnose_model` narrowly catches the silent-stream-cut signature.
+    Any OTHER failure (usage limit, temp block, auth issue) must
+    propagate unchanged so users aren't misled into thinking they
+    have a payload drift when they actually have a quota problem.
+    """
+
+    async def test_propagates_usage_limit_exceeded_unchanged(self):
+        """
+        Given a client whose Pro call raises UsageLimitExceeded,
+        `diagnose_model` must re-raise the original exception, NOT
+        convert it to PayloadValidationError.
+        """
+        from gemini_webapi.client import GeminiClient
+        from gemini_webapi.exceptions import (
+            PayloadValidationError,
+            UsageLimitExceeded,
+        )
+
+        client = GeminiClient.__new__(GeminiClient)
+        client._running = True
+        client.verbose = False
+
+        async def _fake_generate(prompt, *, model=None, **_kw):
+            raise UsageLimitExceeded("pro daily quota exhausted")
+
+        with patch.object(
+            client, "generate_content", new=AsyncMock(side_effect=_fake_generate)
+        ):
+            with self.assertRaises(UsageLimitExceeded):
+                await client.diagnose_model("gemini-3.1-pro")
+
+        # Sanity: UsageLimitExceeded is not a PayloadValidationError subclass,
+        # so the assertRaises above is type-meaningful (not accidentally
+        # satisfied by a subclass relationship).
+        self.assertFalse(
+            issubclass(UsageLimitExceeded, PayloadValidationError),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

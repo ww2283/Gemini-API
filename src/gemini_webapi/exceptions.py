@@ -82,3 +82,16 @@ class DeepThinkUnavailable(GeminiError):
     Typically means the deep think quota is exhausted or the server couldn't process."""
 
     pass
+
+
+class PayloadValidationError(GeminiError):
+    """
+    Raised when the client's request payload is silently rejected by the
+    Gemini server for a specific model while a different model succeeds,
+    indicating payload fingerprint drift.
+
+    Subclass of GeminiError (NOT APIError) so ``@running`` does not retry it —
+    the point is immediate surfacing of a bug that retries cannot fix.
+    """
+
+    pass

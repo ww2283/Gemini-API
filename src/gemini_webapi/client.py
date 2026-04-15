@@ -32,6 +32,7 @@ from .exceptions import (
     DeepThinkUnavailable,
     GeminiError,
     ModelInvalid,
+    PayloadValidationError,
     ServerError,
     TemporarilyBlocked,
     TimeoutError,
@@ -276,6 +277,52 @@ class GeminiClient(ChatMixin, GemMixin):
                     "kind": "value_mismatch",
                 })
         return drift
+
+    async def diagnose_model(self, model_name: str = "gemini-3.1-pro") -> None:
+        """Probe a model to detect payload fingerprint drift.
+
+        Sends a trivial probe to ``model_name`` and to ``gemini-3.0-flash``.
+        If the target model fails with a silent-stream ``APIError`` AND
+        flash succeeds, raises :class:`PayloadValidationError` pointing
+        at the diag CLI. Otherwise returns ``None``.
+
+        Non-matching errors (quota, auth, outage) propagate unchanged so
+        the probe cannot mask unrelated failures. This method is
+        intentionally NOT wrapped with ``@running``: it is a diagnostic
+        call, and the inner ``generate_content`` calls already carry
+        their own retry policy. In real use, callers should expect that
+        a failing probe will wait through ``generate_content``'s retries
+        before surfacing.
+        """
+        target_error: APIError | None = None
+        try:
+            await self.generate_content(
+                "reply one word: ok", model=model_name
+            )
+        except APIError as err:
+            if "stream interrupted" in str(err).lower():
+                target_error = err
+            else:
+                raise
+        else:
+            return None
+
+        try:
+            await self.generate_content(
+                "reply one word: ok", model="gemini-3.0-flash"
+            )
+        except APIError:
+            # Flash also broken — not a drift fingerprint; surface the
+            # original target error unchanged.
+            raise target_error
+
+        raise PayloadValidationError(
+            f"Target model {model_name!r} failed with the silent-stream "
+            f"signature while gemini-3.0-flash succeeded. This is the "
+            f"payload drift fingerprint. Run "
+            f"'python -m gemini_webapi.diag --model pro' for a full "
+            f"slot-by-slot diff."
+        )
 
     def _build_chrome_headers(self) -> dict[str, str]:
         """Build sec-ch-ua headers matching the actual Chrome version."""
