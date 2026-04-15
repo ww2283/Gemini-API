@@ -1463,7 +1463,7 @@ class TestDiagCliExitCodes(unittest.IsolatedAsyncioTestCase):
             new=AsyncMock(return_value=fake_five_tuple),
         ), patch("sys.stdout", new=captured):
             exit_code = await main(
-                ["--model", "pro", "--cookies", "/nonexistent/fake.json"]
+                ["--model", "pro", "--cookies", "/nonexistent/fake.json", "--no-cdp"]
             )
 
         self.assertEqual(
@@ -1507,7 +1507,7 @@ class TestDiagCliExitCodes(unittest.IsolatedAsyncioTestCase):
             new=AsyncMock(return_value=fake_five_tuple),
         ), patch("sys.stdout", new=captured):
             exit_code = await main(
-                ["--model", "pro", "--cookies", "/nonexistent/fake.json"]
+                ["--model", "pro", "--cookies", "/nonexistent/fake.json", "--no-cdp"]
             )
 
         self.assertEqual(
