@@ -844,6 +844,7 @@ class GeminiClient(ChatMixin, GemMixin):
             inner_req_list[41] = [1]
             inner_req_list[53] = 0
             inner_req_list[61] = []
+            inner_req_list[67] = 0
             inner_req_list[68] = 1
             # Slot 79: model variant extracted from jspb header (position 11)
             jspb_str = model.model_header.get("x-goog-ext-525001261-jspb", "")
