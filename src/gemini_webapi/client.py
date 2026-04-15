@@ -58,6 +58,20 @@ from .utils import (
 )
 
 
+# Positions excluded from inner_req_list drift detection because they carry
+# per-request dynamic content (message, metadata, tokens, UUIDs, gem IDs).
+_DIFF_EXCLUDED_SLOTS: frozenset[int] = frozenset({
+    0,   # message_content
+    2,   # chat metadata
+    3,   # WAA token
+    4,   # botguard hash
+    19,  # gem_id
+    59,  # per-request UUID
+    TEMPORARY_CHAT_FLAG_INDEX,
+    DEEP_THINK_FLAG_INDEX,
+})
+
+
 class GeminiClient(ChatMixin, GemMixin):
     """
     Async client interface for gemini.google.com.
@@ -169,7 +183,9 @@ class GeminiClient(ChatMixin, GemMixin):
                     "__Secure-1PSIDTS", secure_1psidts, domain=".google.com"
                 )
 
-    async def _get_waa_token(self) -> tuple[str | None, str | None]:
+    async def _get_waa_token(
+        self, target_model_type: str | None = None
+    ) -> tuple[str | None, str | None]:
         """Obtain a WAA/BotGuard token and paired hash from the configured provider.
         Also captures browser version for header matching and discovers
         current model IDs from the Gemini page.
@@ -184,17 +200,20 @@ class GeminiClient(ChatMixin, GemMixin):
             if self.waa_token_provider is True:
                 from .utils.waa_token import harvest_waa_token
 
-                result = await harvest_waa_token(self.cookies)
+                result = await harvest_waa_token(
+                    self.cookies, target_model=target_model_type
+                )
                 if isinstance(result, tuple):
                     if len(result) == 5:
                         token, browser_version, model_ids, botguard_hash, reference_inner = result
                         if model_ids:
                             self._discovered_model_ids = model_ids
                         if reference_inner is not None:
+                            cache_key = target_model_type or "flash"
                             try:
-                                self._reference_inner_req_lists["flash"] = reference_inner
+                                self._reference_inner_req_lists[cache_key] = reference_inner
                             except AttributeError:
-                                self._reference_inner_req_lists = {"flash": reference_inner}
+                                self._reference_inner_req_lists = {cache_key: reference_inner}
                     elif len(result) == 4:
                         token, browser_version, model_ids, botguard_hash = result
                         if model_ids:
@@ -219,6 +238,44 @@ class GeminiClient(ChatMixin, GemMixin):
         except Exception as e:
             logger.warning(f"WAA token harvesting failed: {e}")
             return None, None
+
+    def _diff_inner_req_list(
+        self, model_type: str, built_inner: list
+    ) -> list[dict]:
+        """Compare built_inner against the cached Chrome reference for model_type.
+
+        Returns a list of drift entries describing slot-level differences.
+        Slots in _DIFF_EXCLUDED_SLOTS are ignored. When no reference is cached
+        for model_type, returns an empty list (degrades gracefully).
+        """
+        reference_cache = getattr(self, "_reference_inner_req_lists", {})
+        if model_type not in reference_cache:
+            return []
+        reference = reference_cache[model_type]
+        drift: list[dict] = []
+        limit = min(len(built_inner), len(reference))
+        for position in range(limit):
+            if position in _DIFF_EXCLUDED_SLOTS:
+                continue
+            r = reference[position]
+            c = built_inner[position]
+            if r is None:
+                continue
+            if c is None:
+                drift.append({
+                    "position": position,
+                    "client_value": None,
+                    "chrome_value": r,
+                    "kind": "missing_in_client",
+                })
+            elif r != c:
+                drift.append({
+                    "position": position,
+                    "client_value": c,
+                    "chrome_value": r,
+                    "kind": "value_mismatch",
+                })
+        return drift
 
     def _build_chrome_headers(self) -> dict[str, str]:
         """Build sec-ch-ua headers matching the actual Chrome version."""
@@ -866,7 +923,10 @@ class GeminiClient(ChatMixin, GemMixin):
                     pass
 
             # WAA/BotGuard attestation token + paired hash for extended stream lifetime.
-            waa_token, botguard_hash = await self._get_waa_token()
+            model_type = self._MODEL_TYPE_MAP.get(model.model_name)
+            waa_token, botguard_hash = await self._get_waa_token(
+                target_model_type=model_type
+            )
             if waa_token:
                 inner_req_list[3] = waa_token
             if botguard_hash:
@@ -878,6 +938,19 @@ class GeminiClient(ChatMixin, GemMixin):
             # Per-request UUID shared between inner_req_list[59] and header
             uuid_val = str(uuid.uuid4())
             inner_req_list[59] = uuid_val
+
+            # Payload drift detection: compare against Chrome reference cached
+            # by the harvester for this model type. Warnings only — never blocks.
+            if model_type:
+                for drift in self._diff_inner_req_list(model_type, inner_req_list):
+                    logger.warning(
+                        f"PayloadDrift: slot={drift['position']} "
+                        f"client={drift['client_value']!r} "
+                        f"chrome={drift['chrome_value']!r} "
+                        f"kind={drift['kind']} model={model_type} — "
+                        f"run 'python -m gemini_webapi.diag --model {model_type}' for full diff"
+                    )
+
             request_headers = {
                 **self._resolve_model_header(model, target_variant=target_variant),
                 **self._build_chrome_headers(),

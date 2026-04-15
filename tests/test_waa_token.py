@@ -740,5 +740,302 @@ class TestGetWaaTokenFourTupleBackwardCompat(unittest.IsolatedAsyncioTestCase):
         )
 
 
+# ---------------------------------------------------------------------------
+# Phase 1b + Phase 2: target_model_type routing and drift diff helper
+#
+# Phase 1b widens `_get_waa_token` so callers can specify WHICH model type
+# the captured reference_inner belongs to.  Today's bug that kicked off the
+# whole drift-detector initiative was Pro-specific, so a "flash"-only cache
+# would miss it entirely.  The `target_model_type` argument lets `_generate`
+# pre-select the model before harvesting and stash the reference under the
+# matching key.
+#
+# Phase 2 introduces `_diff_inner_req_list(model_type, built_inner)` on the
+# client.  It compares the list the client is about to send against the
+# cached reference captured from the real browser and returns a list of
+# drift entries describing any mismatches.  The EXCLUDED slots are the
+# dynamic per-request fields (message content, WAA token, gem id, etc.)
+# that would otherwise swamp the diff with noise.
+# ---------------------------------------------------------------------------
+
+
+class TestGetWaaTokenStoresReferenceUnderTargetModelType(unittest.IsolatedAsyncioTestCase):
+    """
+    Phase 1b: `_get_waa_token(target_model_type="pro")` must cache the
+    reference_inner from a 5-tuple return under the key `"pro"` rather
+    than the hardcoded `"flash"` key Phase 1 used.
+
+    Why: Today's drift bug was Pro-specific. A flash-only reference cannot
+    catch Pro slot drift. The `target_model_type` argument is how
+    `_generate` tells `_get_waa_token` which model reference to cache.
+    """
+
+    async def test_stores_reference_inner_under_target_model_type_key(self):
+        """
+        Given a call to `_get_waa_token(target_model_type="pro")` where
+        `harvest_waa_token` returns a 5-tuple, the reference_inner should
+        be cached under `client._reference_inner_req_lists["pro"]`, not
+        under `"flash"`.
+
+        This test fails because `_get_waa_token` today hardcodes the
+        cache key as `"flash"` and does not accept a `target_model_type`
+        parameter.
+        """
+        token = "!tok_target_model_type"
+        bg_hash = "e" * 32
+        reference_inner = _make_reference_inner(token, bg_hash)
+        browser_version = "146.0.7680.178"
+        model_ids = {"pro": ["cafebabecafebabe"]}
+
+        mock_harvest = AsyncMock(
+            return_value=(token, browser_version, model_ids, bg_hash, reference_inner)
+        )
+
+        client = _make_client_with_provider(waa_token_provider=True)
+        client._reference_inner_req_lists = {}
+
+        with patch(
+            "gemini_webapi.utils.waa_token.harvest_waa_token",
+            mock_harvest,
+        ):
+            result = await client._get_waa_token(target_model_type="pro")
+
+        # Backward compat: return shape unchanged
+        self.assertEqual(result, (token, bg_hash))
+
+        # The reference must be cached under "pro", not "flash"
+        self.assertIn("pro", client._reference_inner_req_lists)
+        self.assertEqual(
+            client._reference_inner_req_lists["pro"],
+            reference_inner,
+        )
+        self.assertIsNone(
+            client._reference_inner_req_lists.get("flash"),
+            "`target_model_type='pro'` must NOT populate the 'flash' key. "
+            "Today's Pro drift bug would be silently miscategorised.",
+        )
+
+
+class TestGetWaaTokenDefaultsToFlashKey(unittest.IsolatedAsyncioTestCase):
+    """
+    Phase 1b backward-compat: callers that don't pass `target_model_type`
+    should continue to see the reference cached under `"flash"` so that
+    existing Phase 1 tests and any in-flight callers keep working.
+    """
+
+    async def test_defaults_to_flash_when_target_model_type_is_none(self):
+        """
+        Given `_get_waa_token(target_model_type=None)` explicitly passed,
+        the reference_inner should still be cached under the legacy
+        `"flash"` key so existing callers keep working.
+
+        This test fails because `_get_waa_token` does not yet accept a
+        `target_model_type` keyword argument at all -- calling it with
+        `target_model_type=None` raises TypeError.
+        """
+        token = "!tok_default_key"
+        bg_hash = "f" * 32
+        reference_inner = _make_reference_inner(token, bg_hash)
+
+        mock_harvest = AsyncMock(
+            return_value=(token, "146.0.7680.178", {}, bg_hash, reference_inner)
+        )
+
+        client = _make_client_with_provider(waa_token_provider=True)
+        client._reference_inner_req_lists = {}
+
+        with patch(
+            "gemini_webapi.utils.waa_token.harvest_waa_token",
+            mock_harvest,
+        ):
+            await client._get_waa_token(target_model_type=None)
+
+        self.assertEqual(
+            client._reference_inner_req_lists.get("flash"),
+            reference_inner,
+            "Default (target_model_type=None) must fall back to 'flash' key.",
+        )
+
+
+class TestDiffInnerReqListMissingSlot(unittest.TestCase):
+    """
+    Phase 2: `_diff_inner_req_list(model_type, built_inner)` must report
+    slots where the reference has a non-None value but the built list
+    has None -- this is exactly today's bug class (Chrome sends a slot
+    the client omits).
+    """
+
+    def test_reports_missing_slot_when_client_omits_non_none_reference_value(self):
+        """
+        Given a cached reference where slot 67 is 0 and a built inner
+        where slot 67 is None, `_diff_inner_req_list` returns a single
+        drift entry for position 67 with kind `missing_in_client`.
+
+        This test fails because `_diff_inner_req_list` does not exist on
+        `GeminiClient` yet.
+        """
+        from gemini_webapi.client import GeminiClient
+
+        reference: list[Any] = [None] * 80
+        reference[67] = 0  # Chrome sends this slot
+        built: list[Any] = [None] * 80
+        # built[67] stays None -- this is the drift
+
+        client = GeminiClient.__new__(GeminiClient)
+        client._reference_inner_req_lists = {"pro": reference}
+
+        drift = client._diff_inner_req_list("pro", built)
+
+        self.assertIsInstance(drift, list)
+        self.assertEqual(
+            len(drift), 1,
+            f"Expected exactly one drift entry for slot 67, got {drift!r}",
+        )
+        entry = drift[0]
+        self.assertEqual(entry["position"], 67)
+        self.assertEqual(entry["kind"], "missing_in_client")
+        self.assertIsNone(entry["client_value"])
+        self.assertEqual(entry["chrome_value"], 0)
+
+
+class TestDiffInnerReqListValueMismatch(unittest.TestCase):
+    """
+    Phase 2: when both the reference and built lists have values at the
+    same position but the values differ, the helper must emit a
+    `value_mismatch` drift entry so Green-phase logging can surface it.
+    """
+
+    def test_reports_value_mismatch_when_slot_differs(self):
+        """
+        Given a cached reference where slot 58 is "chrome_value" and a
+        built inner where slot 58 is "client_value", `_diff_inner_req_list`
+        returns a single drift entry with kind `value_mismatch`.
+
+        This test fails because `_diff_inner_req_list` does not exist yet.
+        """
+        from gemini_webapi.client import GeminiClient
+
+        reference: list[Any] = [None] * 80
+        reference[58] = "chrome_value"
+        built: list[Any] = [None] * 80
+        built[58] = "client_value"
+
+        client = GeminiClient.__new__(GeminiClient)
+        client._reference_inner_req_lists = {"pro": reference}
+
+        drift = client._diff_inner_req_list("pro", built)
+
+        self.assertEqual(len(drift), 1)
+        entry = drift[0]
+        self.assertEqual(entry["position"], 58)
+        self.assertEqual(entry["kind"], "value_mismatch")
+        self.assertEqual(entry["client_value"], "client_value")
+        self.assertEqual(entry["chrome_value"], "chrome_value")
+
+
+class TestDiffInnerReqListExcludesDynamicSlots(unittest.TestCase):
+    """
+    Phase 2: positions listed in the module-level `_DIFF_EXCLUDED_SLOTS`
+    constant must be silently skipped by the diff helper.  These are the
+    per-request dynamic slots (message content, WAA token, botguard hash,
+    gem id, UUID, temporary chat / deep think flags) -- including them
+    would produce noise on every single request and mask the rare real
+    drift we actually care about.
+    """
+
+    def test_dynamic_slots_are_not_reported(self):
+        """
+        Given a reference and built inner that differ at slot 3 (WAA
+        token, excluded) AND at slot 67 (real drift), `_diff_inner_req_list`
+        returns exactly one drift entry -- for slot 67, not slot 3.
+
+        Also asserts the exclusion set is named exactly `_DIFF_EXCLUDED_SLOTS`
+        in `gemini_webapi.client` and contains at least the documented
+        dynamic slots {0, 2, 3, 4, 19, 59} plus TEMPORARY_CHAT_FLAG_INDEX
+        and DEEP_THINK_FLAG_INDEX.
+
+        This test fails because neither `_DIFF_EXCLUDED_SLOTS` nor
+        `_diff_inner_req_list` exist yet.
+        """
+        from gemini_webapi import client as client_module
+        from gemini_webapi.client import GeminiClient
+        from gemini_webapi.constants import (
+            DEEP_THINK_FLAG_INDEX,
+            TEMPORARY_CHAT_FLAG_INDEX,
+        )
+
+        # 1) Contract on the exclusion set itself -- this IS the behavior
+        # the test pins down; the whole point is that these slots are excluded.
+        self.assertTrue(
+            hasattr(client_module, "_DIFF_EXCLUDED_SLOTS"),
+            "`_DIFF_EXCLUDED_SLOTS` must be defined at module level in "
+            "gemini_webapi.client.",
+        )
+        excluded = client_module._DIFF_EXCLUDED_SLOTS
+        for required_slot in (0, 2, 3, 4, 19, 59):
+            self.assertIn(
+                required_slot,
+                excluded,
+                f"Slot {required_slot} must be in _DIFF_EXCLUDED_SLOTS -- "
+                f"it is a documented dynamic per-request slot.",
+            )
+        self.assertIn(TEMPORARY_CHAT_FLAG_INDEX, excluded)
+        self.assertIn(DEEP_THINK_FLAG_INDEX, excluded)
+
+        # 2) The helper must actually honour the exclusion set.
+        reference: list[Any] = [None] * 80
+        reference[3] = "!chrome_waa_token"  # excluded slot, real diff
+        reference[67] = 0  # non-excluded slot, real diff
+
+        built: list[Any] = [None] * 80
+        built[3] = "!client_waa_token"  # differs, but must be ignored
+        # built[67] stays None -- this is the ONE drift we care about
+
+        client = GeminiClient.__new__(GeminiClient)
+        client._reference_inner_req_lists = {"pro": reference}
+
+        drift = client._diff_inner_req_list("pro", built)
+
+        self.assertEqual(
+            len(drift), 1,
+            f"Expected exactly one drift entry (slot 67); slot 3 should be "
+            f"silently excluded. Got: {drift!r}",
+        )
+        self.assertEqual(drift[0]["position"], 67)
+
+
+class TestDiffInnerReqListNoCachedReference(unittest.TestCase):
+    """
+    Phase 2: drift detection is best-effort.  If no reference has been
+    captured yet for the requested model type (harvester hasn't run,
+    failed, or captured a different model), the helper must degrade
+    gracefully by returning `[]` -- no warning, no false positives,
+    no exception.
+    """
+
+    def test_returns_empty_list_when_no_cached_reference_for_model_type(self):
+        """
+        Given a GeminiClient with an empty `_reference_inner_req_lists`,
+        `_diff_inner_req_list("pro", built_inner)` returns `[]`.
+
+        This test fails because `_diff_inner_req_list` does not exist yet.
+        """
+        from gemini_webapi.client import GeminiClient
+
+        built: list[Any] = [None] * 80
+        built[67] = "something"
+
+        client = GeminiClient.__new__(GeminiClient)
+        client._reference_inner_req_lists = {}
+
+        drift = client._diff_inner_req_list("pro", built)
+
+        self.assertEqual(
+            drift, [],
+            "Missing reference data must degrade to an empty drift list -- "
+            "no false positives, no exceptions.",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
