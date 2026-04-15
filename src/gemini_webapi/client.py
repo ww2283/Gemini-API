@@ -438,6 +438,7 @@ class GeminiClient(ChatMixin, GemMixin):
 
         if self.client:
             await self.client.close()
+            self.client = None
 
     async def reset_connection(self) -> None:
         """
