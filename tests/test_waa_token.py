@@ -1290,5 +1290,243 @@ class TestDiagnoseModelPropagatesNonMatchingErrors(
         )
 
 
+# ---------------------------------------------------------------------------
+# R4: Payload drift diag CLI (Phase 4)
+#
+# Two new surfaces:
+#   1. `build_diagnostic_inner_req_list(model, prompt, chat_metadata)` --
+#      a module-level pure helper that produces the same 80-element
+#      inner_req_list `_generate` would build, with dynamic slots left as
+#      sentinels so the diff helper (which already excludes those slots)
+#      can compare against a Chrome reference without spawning a real
+#      stream.
+#   2. `gemini_webapi.diag.main(argv)` -- an on-demand CLI that harvests
+#      a real Chrome StreamGenerate reference for a target model, builds
+#      the library's inner for the same model, diffs them slot-by-slot,
+#      prints the result, and returns 0 on clean / 1 on drift.
+#
+# These tests MUST FAIL because neither symbol exists yet.
+# ---------------------------------------------------------------------------
+
+
+class TestBuildDiagnosticInnerReqList(unittest.TestCase):
+    """
+    `build_diagnostic_inner_req_list` extracts the inner_req_list
+    construction logic from `_generate` into a pure function so the
+    diag CLI (and any future drift tooling) can produce the exact
+    80-element list the library would send -- without spawning a
+    browser, hitting the network, or instantiating a client.
+    """
+
+    def test_returns_80_element_list_with_expected_slots(self):
+        """
+        For Model.G_3_1_PRO with the default "probe" prompt, the
+        builder returns a list matching the structural contract of
+        `_generate`: length 80, message list at slot 0, fixed
+        browser-parity slots populated, Pro jspb variant at slot 79.
+        """
+        from gemini_webapi.client import build_diagnostic_inner_req_list
+        from gemini_webapi.constants import Model
+
+        result = build_diagnostic_inner_req_list(Model.G_3_1_PRO)
+
+        self.assertEqual(
+            len(result),
+            80,
+            "inner_req_list must be exactly 80 slots to match _generate",
+        )
+
+        # Slot 0: 7-element message_content list starting with prompt text.
+        self.assertIsInstance(result[0], list)
+        self.assertEqual(
+            len(result[0]),
+            7,
+            f"message_content must have 7 elements; got {len(result[0])}",
+        )
+        self.assertEqual(
+            result[0][0],
+            "probe",
+            "Default prompt text must populate slot 0[0]",
+        )
+
+        # Slot 1: language list.
+        self.assertEqual(result[1], ["en"])
+
+        # Slot 67: the drift-prone slot we care about in this release.
+        self.assertEqual(
+            result[67],
+            0,
+            "Slot 67 must be 0 to match the client's browser-parity "
+            "fixed value (this is precisely the slot we want drift "
+            "tooling to surface).",
+        )
+
+        # Slot 79: Pro variant from jspb header position 11 == 3.
+        self.assertEqual(
+            result[79],
+            3,
+            "Pro variant at slot 79 must equal 3 (jspb[11] for Pro)",
+        )
+
+        # Slots 3 and 4 are WAA token / botguard hash. The builder
+        # must NOT call the real harvester -- these slots should be
+        # either None or a clearly-marked sentinel. Accept both.
+        token_slot = result[3]
+        hash_slot = result[4]
+        self.assertTrue(
+            token_slot is None or isinstance(token_slot, str),
+            f"Slot 3 must be None or a sentinel string; got {token_slot!r}",
+        )
+        self.assertTrue(
+            hash_slot is None or isinstance(hash_slot, str),
+            f"Slot 4 must be None or a sentinel string; got {hash_slot!r}",
+        )
+
+    def test_respects_custom_prompt_argument(self):
+        """
+        Passing prompt="hello world" routes the custom prompt into
+        slot 0[0] verbatim so CLI users can supply a probe string
+        that more closely matches their failing production payload.
+        """
+        from gemini_webapi.client import build_diagnostic_inner_req_list
+        from gemini_webapi.constants import Model
+
+        result = build_diagnostic_inner_req_list(
+            Model.G_3_1_PRO, prompt="hello world"
+        )
+
+        self.assertEqual(
+            result[0][0],
+            "hello world",
+            "Custom prompt must propagate to slot 0[0]",
+        )
+
+    def test_uses_flash_variant_for_flash_model(self):
+        """
+        Switching to Model.G_3_0_FLASH must change slot 79 to 1
+        (Flash jspb[11] variant). This proves the builder is wired
+        to the model argument and not hard-coded to Pro.
+        """
+        from gemini_webapi.client import build_diagnostic_inner_req_list
+        from gemini_webapi.constants import Model
+
+        result = build_diagnostic_inner_req_list(Model.G_3_0_FLASH)
+
+        self.assertEqual(
+            result[79],
+            1,
+            "Flash variant at slot 79 must equal 1 (jspb[11] for Flash)",
+        )
+
+
+class TestDiagCliExitCodes(unittest.IsolatedAsyncioTestCase):
+    """
+    `gemini_webapi.diag.main` is the on-demand CLI entry point.
+
+    Contract:
+      - Returns 0 when the harvester's Chrome reference matches
+        what `build_diagnostic_inner_req_list` produces for the
+        same model (no drift).
+      - Returns 1 when the diff is non-empty, and prints the
+        drifted slot position to stdout so maintainers can spot
+        it in under 30 seconds.
+
+    Tests mock `harvest_waa_token` so no browser spawns and no
+    real Google cookies are required.
+    """
+
+    async def test_main_returns_0_when_no_drift(self):
+        """
+        When the mocked harvester returns a reference_inner that
+        is identical to what build_diagnostic_inner_req_list
+        produces for Pro, `main` must exit 0 and not raise.
+        """
+        import io
+
+        from gemini_webapi.client import build_diagnostic_inner_req_list
+        from gemini_webapi.constants import Model
+        from gemini_webapi.diag import main
+
+        # Reference that matches the builder exactly -> zero drift.
+        reference_inner = build_diagnostic_inner_req_list(Model.G_3_1_PRO)
+        fake_five_tuple = (
+            "!fake_token",
+            "146.0.0.0",
+            {"pro": "abc"},
+            "fake_hash",
+            reference_inner,
+        )
+
+        captured = io.StringIO()
+        with patch(
+            "gemini_webapi.diag.harvest_waa_token",
+            new=AsyncMock(return_value=fake_five_tuple),
+        ), patch("sys.stdout", new=captured):
+            exit_code = await main(
+                ["--model", "pro", "--cookies", "/nonexistent/fake.json"]
+            )
+
+        self.assertEqual(
+            exit_code,
+            0,
+            f"main must return 0 when reference matches builder "
+            f"(no drift). stdout was: {captured.getvalue()!r}",
+        )
+
+    async def test_main_returns_1_when_drift_detected(self):
+        """
+        When the mocked harvester returns a reference_inner that
+        differs from the builder at a single slot, `main` must
+        return 1 and print the drifted slot number to stdout so
+        the maintainer can see which position drifted.
+        """
+        import io
+
+        from gemini_webapi.client import build_diagnostic_inner_req_list
+        from gemini_webapi.constants import Model
+        from gemini_webapi.diag import main
+
+        # Clone the builder output and mutate a non-excluded slot so
+        # _diff_inner_req_list will flag it. Slot 67 is the obvious
+        # candidate -- it's the very slot we expect drift tooling
+        # to surface in practice.
+        reference_inner = list(build_diagnostic_inner_req_list(Model.G_3_1_PRO))
+        reference_inner[67] = 999  # != builder's 0
+
+        fake_five_tuple = (
+            "!fake_token",
+            "146.0.0.0",
+            {"pro": "abc"},
+            "fake_hash",
+            reference_inner,
+        )
+
+        captured = io.StringIO()
+        with patch(
+            "gemini_webapi.diag.harvest_waa_token",
+            new=AsyncMock(return_value=fake_five_tuple),
+        ), patch("sys.stdout", new=captured):
+            exit_code = await main(
+                ["--model", "pro", "--cookies", "/nonexistent/fake.json"]
+            )
+
+        self.assertEqual(
+            exit_code,
+            1,
+            f"main must return 1 when a slot drifts. "
+            f"stdout was: {captured.getvalue()!r}",
+        )
+
+        # The drifted slot number must appear in the CLI output so
+        # maintainers can identify it at a glance.
+        output = captured.getvalue()
+        self.assertIn(
+            "67",
+            output,
+            f"CLI output must name the drifted slot (67). "
+            f"Got: {output!r}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

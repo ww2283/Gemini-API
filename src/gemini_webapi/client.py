@@ -73,6 +73,50 @@ _DIFF_EXCLUDED_SLOTS: frozenset[int] = frozenset({
 })
 
 
+def build_diagnostic_inner_req_list(
+    model: "Model",
+    prompt: str = "probe",
+    chat_metadata: list | None = None,
+) -> list:
+    """Build the inner_req_list the library would send to StreamGenerate
+    for the given model and prompt.
+
+    Dynamic per-request slots (WAA token, botguard hash, UUID) are left
+    as None. Used by the diag CLI to diff what the client WOULD send
+    against what Chrome actually sends.
+    """
+    inner_req_list: list[Any] = [None] * 80
+    inner_req_list[0] = [prompt, 0, None, None, None, None, 0]
+    inner_req_list[1] = ["en"]
+    inner_req_list[2] = (
+        chat_metadata
+        if chat_metadata is not None
+        else ["", "", "", None, None, None, None, None, None, ""]
+    )
+    # slots 3 and 4 remain None (WAA token / botguard hash sentinels)
+    inner_req_list[6] = [0]
+    inner_req_list[7] = 1
+    inner_req_list[10] = 1
+    inner_req_list[11] = 0
+    inner_req_list[17] = [[0]]
+    inner_req_list[18] = 0
+    inner_req_list[27] = 1
+    inner_req_list[30] = [4]
+    inner_req_list[41] = [1]
+    inner_req_list[53] = 0
+    # slot 59 stays None (per-request UUID)
+    inner_req_list[61] = []
+    inner_req_list[67] = 0
+    inner_req_list[68] = 1
+    jspb_str = model.model_header.get("x-goog-ext-525001261-jspb", "")
+    if jspb_str:
+        try:
+            inner_req_list[79] = json.loads(jspb_str)[11]
+        except Exception:
+            pass
+    return inner_req_list
+
+
 class GeminiClient(ChatMixin, GemMixin):
     """
     Async client interface for gemini.google.com.
