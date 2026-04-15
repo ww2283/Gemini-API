@@ -133,6 +133,7 @@ class GeminiClient(ChatMixin, GemMixin):
         self.build_label: str | None = None
         self.session_id: str | None = None
         self._discovered_model_ids: dict[str, list[str]] = {}
+        self._reference_inner_req_lists: dict[str, list] = {}
         self.timeout: float = 300
         self.auto_close: bool = False
         self.close_delay: float = 300
@@ -185,7 +186,16 @@ class GeminiClient(ChatMixin, GemMixin):
 
                 result = await harvest_waa_token(self.cookies)
                 if isinstance(result, tuple):
-                    if len(result) == 4:
+                    if len(result) == 5:
+                        token, browser_version, model_ids, botguard_hash, reference_inner = result
+                        if model_ids:
+                            self._discovered_model_ids = model_ids
+                        if reference_inner is not None:
+                            try:
+                                self._reference_inner_req_lists["flash"] = reference_inner
+                            except AttributeError:
+                                self._reference_inner_req_lists = {"flash": reference_inner}
+                    elif len(result) == 4:
                         token, browser_version, model_ids, botguard_hash = result
                         if model_ids:
                             self._discovered_model_ids = model_ids

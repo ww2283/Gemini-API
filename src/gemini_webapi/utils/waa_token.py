@@ -64,6 +64,30 @@ if TYPE_CHECKING:
     from curl_cffi.requests import Cookies
 
 
+def _parse_stream_generate_request(post_data: str) -> dict | None:
+    """Parse URL-form-encoded post_data from a StreamGenerate request.
+
+    Returns dict with keys 'token', 'botguard_hash', 'reference_inner'
+    on success, or None if post_data cannot be parsed.
+    """
+    try:
+        params = parse_qs(post_data)
+        f_req = params.get("f.req", [None])[0]
+        if not f_req:
+            return None
+        outer = json.loads(f_req)
+        inner = json.loads(outer[1])
+        token = inner[3] if len(inner) > 3 else None
+        botguard_hash = inner[4] if len(inner) > 4 else None
+        return {
+            "token": token,
+            "botguard_hash": botguard_hash,
+            "reference_inner": inner,
+        }
+    except Exception:
+        return None
+
+
 def _cookies_for_playwright(httpx_cookies) -> list[dict]:
     """Convert curl_cffi.requests.Cookies to Playwright's list-of-dicts format."""
     result = []
@@ -120,8 +144,10 @@ async def harvest_waa_token(cookies: Cookies, timeout: float = 45.0) -> str:
         timeout: Maximum time in seconds to wait for token extraction.
 
     Returns:
-        Tuple of (token, browser_version) where token starts with '!' (~1.3KB)
-        and browser_version is e.g. '146.0.7680.178'.
+        Tuple of (token, browser_version, model_ids, botguard_hash, reference_inner)
+        where token starts with '!' (~1.3KB), browser_version is e.g.
+        '146.0.7680.178', and reference_inner is the full decoded inner_req_list
+        captured from the intercepted StreamGenerate request.
 
     Raises:
         WAATokenError: If token harvesting fails for any reason.
@@ -142,25 +168,24 @@ async def harvest_waa_token(cookies: Cookies, timeout: float = 45.0) -> str:
 
     token: str | None = None
     botguard_hash: str | None = None
+    reference_inner: list | None = None
     token_event = asyncio.Event()
 
     async def _handle_route(route):
-        nonlocal token, botguard_hash
+        nonlocal token, botguard_hash, reference_inner
         try:
             request = route.request
             post_data = request.post_data
             if post_data:
-                params = parse_qs(post_data)
-                f_req = params.get("f.req", [None])[0]
-                if f_req:
-                    outer = json.loads(f_req)
-                    inner = json.loads(outer[1])
-                    candidate = inner[3]
+                parsed = _parse_stream_generate_request(post_data)
+                if parsed is not None:
+                    candidate = parsed["token"]
                     if isinstance(candidate, str) and candidate.startswith("!"):
                         token = candidate
-                        # Position [4] is a BotGuard hash paired with the token
-                        if len(inner) > 4 and isinstance(inner[4], str):
-                            botguard_hash = inner[4]
+                        hash_candidate = parsed["botguard_hash"]
+                        if isinstance(hash_candidate, str):
+                            botguard_hash = hash_candidate
+                        reference_inner = parsed["reference_inner"]
                         token_event.set()
         except Exception:
             pass
@@ -256,7 +281,7 @@ async def harvest_waa_token(cookies: Cookies, timeout: float = 45.0) -> str:
             except Exception:
                 pass
 
-            return token, browser_version, model_ids, botguard_hash
+            return token, browser_version, model_ids, botguard_hash, reference_inner
 
     except WAATokenError:
         raise

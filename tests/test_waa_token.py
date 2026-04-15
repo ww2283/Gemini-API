@@ -16,6 +16,7 @@ These tests MUST FAIL because _generate() does not yet call _get_waa_token().
 import asyncio
 import unittest
 from contextlib import asynccontextmanager
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import orjson as json
@@ -471,6 +472,272 @@ class TestGenerateCallsGetWaaToken(unittest.IsolatedAsyncioTestCase):
                 pass  # Expected
 
         mock_get_waa.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: reference_inner_req_list capture
+#
+# The harvester already extracts inner[3] (WAA token) and inner[4] (BotGuard
+# hash) from the intercepted StreamGenerate request.  Phase 1 extends this
+# to capture the FULL 80-element inner_req_list so downstream code can diff
+# it against what the client is about to send -- catching payload drift
+# (e.g. Google silently enforcing inner[67]=0 for Pro on 2026-04-15) on the
+# very next request instead of after a manual DevTools capture.
+#
+# Contract:
+#   1. A pure helper `_parse_stream_generate_request(post_data) -> dict|None`
+#      exists in utils.waa_token with keys token, botguard_hash, reference_inner.
+#   2. `harvest_waa_token` returns a 5-tuple appended with reference_inner.
+#   3. `GeminiClient._get_waa_token` unpacks the 5-tuple and stores the
+#      reference_inner in `self._reference_inner_req_lists["flash"]`.
+#   4. 3-tuple and 4-tuple returns from older harvester versions still work.
+# ---------------------------------------------------------------------------
+
+from urllib.parse import urlencode
+
+
+def _build_post_data(inner_req_list: list) -> str:
+    """Build a StreamGenerate-style post_data string wrapping inner_req_list.
+
+    Matches the real wire format the harvester parses:
+        f.req = [null, "<json string of inner_req_list>"]
+        &at=<anti-csrf>
+    """
+    outer = [None, json.dumps(inner_req_list).decode("utf-8")]
+    f_req = json.dumps(outer).decode("utf-8")
+    return urlencode({"f.req": f_req, "at": "fake_anti_csrf_token"})
+
+
+def _make_reference_inner(token: str, bg_hash: str) -> list:
+    """Build a synthetic 80-element inner_req_list with known slot values."""
+    inner: list[Any] = [None] * 80
+    inner[3] = token
+    inner[4] = bg_hash
+    inner[67] = 0  # The slot that started the whole saga on 2026-04-15
+    inner[0] = "hello"  # Representative prompt slot
+    return inner
+
+
+class TestParseStreamGenerateRequestHappyPath(unittest.TestCase):
+    """
+    `_parse_stream_generate_request` must decode a real-shape post_data and
+    return a dict exposing token, botguard_hash, and the full reference inner
+    list.  The reference_inner is the Phase 1 deliverable -- it's what
+    downstream payload-drift detection will diff against.
+    """
+
+    def test_extracts_token_hash_and_full_inner_list(self):
+        """
+        Given a post_data containing f.req wrapping an 80-element inner list
+        with inner[3]='!tok', inner[4]='aabb...cc', and inner[67]=0, the
+        helper returns {token, botguard_hash, reference_inner} where
+        reference_inner is the full list with those slots preserved.
+
+        This test fails because `_parse_stream_generate_request` does not
+        exist in `gemini_webapi.utils.waa_token`.
+        """
+        from gemini_webapi.utils.waa_token import _parse_stream_generate_request
+
+        token = "!fake_waa_token_payload_for_test"
+        bg_hash = "a" * 32
+        inner = _make_reference_inner(token, bg_hash)
+        post_data = _build_post_data(inner)
+
+        result = _parse_stream_generate_request(post_data)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["token"], token)
+        self.assertEqual(result["botguard_hash"], bg_hash)
+
+        reference_inner = result["reference_inner"]
+        self.assertIsInstance(reference_inner, list)
+        self.assertEqual(len(reference_inner), 80)
+        self.assertEqual(reference_inner[3], token)
+        self.assertEqual(reference_inner[4], bg_hash)
+        self.assertEqual(reference_inner[67], 0)
+        self.assertEqual(reference_inner[0], "hello")
+
+
+class TestParseStreamGenerateRequestBadInput(unittest.TestCase):
+    """
+    The harvester is best-effort -- a malformed capture must degrade to None
+    rather than raise, so a single bad intercept cannot crash the browser
+    session or leak an exception into the client's token fetch path.
+    """
+
+    def test_returns_none_on_missing_f_req(self):
+        """
+        Given a post_data that has no `f.req` field at all, the helper
+        returns None without raising.
+
+        This test fails because `_parse_stream_generate_request` does not
+        exist in `gemini_webapi.utils.waa_token`.
+        """
+        from gemini_webapi.utils.waa_token import _parse_stream_generate_request
+
+        post_data = urlencode({"at": "only_anti_csrf_no_f_req"})
+
+        result = _parse_stream_generate_request(post_data)
+
+        self.assertIsNone(result)
+
+
+class TestHarvestWaaTokenReturnsReferenceInner(unittest.IsolatedAsyncioTestCase):
+    """
+    `harvest_waa_token` must return a 5-tuple whose last element is the
+    full 80-element reference inner list captured from the intercepted
+    StreamGenerate request.
+
+    NOTE ON TESTABILITY: Mocking the full async_playwright chain is
+    prohibitively brittle (nested async context managers, Route objects,
+    event loops).  Instead, this test drives the pure parser helper and
+    asserts the contract that harvest_waa_token is expected to thread its
+    output through.  The Green-phase assumption is:
+
+        - `_parse_stream_generate_request` is invoked on every intercepted
+          post_data inside `_handle_route`.
+        - Its `reference_inner` value is stored alongside token/hash in
+          the harvester's closure state.
+        - `harvest_waa_token` returns
+          (token, browser_version, model_ids, botguard_hash, reference_inner).
+
+    The 5-tuple return shape is covered directly here by inspecting the
+    function signature / return-annotation is not practical; instead we
+    assert the parser output has the shape the harvester will propagate,
+    and we assert via `TestGetWaaTokenStoresReferenceInner` below that
+    the client-side unpack handles the 5-tuple correctly.  Together these
+    two tests pin down the contract end-to-end without Playwright mocks.
+    """
+
+    async def test_parser_output_matches_5tuple_contract(self):
+        """
+        The parser must expose a reference_inner field that is a plain
+        80-element list -- this IS what harvest_waa_token's 5-tuple last
+        element will be.  If this assertion fails, harvest_waa_token has
+        nothing to put in position [4] of its return tuple.
+
+        This test fails because `_parse_stream_generate_request` does not
+        exist yet.
+        """
+        from gemini_webapi.utils.waa_token import _parse_stream_generate_request
+
+        token = "!another_waa_token"
+        bg_hash = "b" * 32
+        inner = _make_reference_inner(token, bg_hash)
+        post_data = _build_post_data(inner)
+
+        parsed = _parse_stream_generate_request(post_data)
+
+        self.assertIsNotNone(parsed)
+        reference_inner = parsed["reference_inner"]
+        self.assertEqual(len(reference_inner), 80)
+        self.assertEqual(reference_inner[3], token)
+        self.assertEqual(reference_inner[4], bg_hash)
+        self.assertEqual(reference_inner[67], 0)
+
+
+class TestGetWaaTokenStoresReferenceInner(unittest.IsolatedAsyncioTestCase):
+    """
+    When `harvest_waa_token` returns the new 5-tuple, `_get_waa_token` must:
+      1. Keep returning the (token, botguard_hash) 2-tuple to its callers
+         (backward compat -- _generate() does not care about reference_inner).
+      2. Stash the reference_inner list on the client under
+         `self._reference_inner_req_lists["flash"]` so payload-drift detection
+         can pick it up later.
+
+    `_reference_inner_req_lists` is THE contract for Phase 1 -- it is the
+    public (albeit underscore-prefixed) API downstream phases will read.
+    """
+
+    async def test_stores_reference_inner_under_flash_key(self):
+        """
+        Given a patched `harvest_waa_token` that returns a 5-tuple with a
+        synthetic 80-element reference_inner, `_get_waa_token` should:
+          - return `(token, botguard_hash)` to the caller unchanged, AND
+          - set `client._reference_inner_req_lists["flash"]` to the
+            reference_inner list.
+
+        This test fails because harvest_waa_token currently returns a
+        4-tuple and `_reference_inner_req_lists` does not exist on client.
+        """
+        token = "!tok_five_tuple_test"
+        bg_hash = "c" * 32
+        reference_inner = _make_reference_inner(token, bg_hash)
+        browser_version = "146.0.7680.178"
+        model_ids = {"flash": ["deadbeefdeadbeef"]}
+
+        mock_harvest = AsyncMock(
+            return_value=(token, browser_version, model_ids, bg_hash, reference_inner)
+        )
+
+        client = _make_client_with_provider(waa_token_provider=True)
+
+        with patch(
+            "gemini_webapi.utils.waa_token.harvest_waa_token",
+            mock_harvest,
+        ):
+            result = await client._get_waa_token()
+
+        self.assertEqual(result, (token, bg_hash))
+
+        self.assertTrue(
+            hasattr(client, "_reference_inner_req_lists"),
+            "_get_waa_token must create self._reference_inner_req_lists "
+            "when harvest_waa_token returns a 5-tuple.",
+        )
+        self.assertIn("flash", client._reference_inner_req_lists)
+        self.assertEqual(
+            client._reference_inner_req_lists["flash"],
+            reference_inner,
+        )
+        self.assertEqual(len(client._reference_inner_req_lists["flash"]), 80)
+        self.assertEqual(client._reference_inner_req_lists["flash"][67], 0)
+
+
+class TestGetWaaTokenFourTupleBackwardCompat(unittest.IsolatedAsyncioTestCase):
+    """
+    Older pinned installs of the library may still return the 4-tuple from
+    `harvest_waa_token`.  `_get_waa_token` must keep working in that case --
+    returning the normal (token, hash) 2-tuple and NOT populating the
+    reference cache under "flash" (since there's nothing to cache).
+    """
+
+    async def test_four_tuple_return_does_not_populate_reference_cache(self):
+        """
+        Given a patched harvest_waa_token that still returns a 4-tuple,
+        _get_waa_token returns `(token, botguard_hash)` and the reference
+        cache either does not exist or has no "flash" entry.
+
+        This test fails today because `_reference_inner_req_lists` is an
+        attribute the feature must introduce; once introduced, this test
+        also guards the 4-tuple branch against accidentally populating
+        the cache with None.
+        """
+        token = "!tok_four_tuple_test"
+        bg_hash = "d" * 32
+
+        mock_harvest = AsyncMock(
+            return_value=(token, "146.0.7680.178", {}, bg_hash)
+        )
+
+        client = _make_client_with_provider(waa_token_provider=True)
+
+        with patch(
+            "gemini_webapi.utils.waa_token.harvest_waa_token",
+            mock_harvest,
+        ):
+            result = await client._get_waa_token()
+
+        self.assertEqual(result, (token, bg_hash))
+
+        reference_cache = getattr(client, "_reference_inner_req_lists", {})
+        self.assertNotIn(
+            "flash",
+            reference_cache,
+            "4-tuple return from harvest_waa_token must not populate "
+            "_reference_inner_req_lists['flash'] -- there's no reference "
+            "list to cache.",
+        )
 
 
 if __name__ == "__main__":
