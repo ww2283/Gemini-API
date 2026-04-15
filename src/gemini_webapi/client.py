@@ -245,9 +245,7 @@ class GeminiClient(ChatMixin, GemMixin):
             if self.waa_token_provider is True:
                 from .utils.waa_token import harvest_waa_token
 
-                result = await harvest_waa_token(
-                    self.cookies, target_model=target_model_type
-                )
+                result = await harvest_waa_token(self.cookies)
                 if isinstance(result, tuple):
                     if len(result) == 5:
                         token, browser_version, model_ids, botguard_hash, reference_inner = result
@@ -1014,10 +1012,7 @@ class GeminiClient(ChatMixin, GemMixin):
                     pass
 
             # WAA/BotGuard attestation token + paired hash for extended stream lifetime.
-            model_type = self._MODEL_TYPE_MAP.get(model.model_name)
-            waa_token, botguard_hash = await self._get_waa_token(
-                target_model_type=model_type
-            )
+            waa_token, botguard_hash = await self._get_waa_token()
             if waa_token:
                 inner_req_list[3] = waa_token
             if botguard_hash:
@@ -1029,18 +1024,6 @@ class GeminiClient(ChatMixin, GemMixin):
             # Per-request UUID shared between inner_req_list[59] and header
             uuid_val = str(uuid.uuid4())
             inner_req_list[59] = uuid_val
-
-            # Payload drift detection: compare against Chrome reference cached
-            # by the harvester for this model type. Warnings only — never blocks.
-            if model_type:
-                for drift in self._diff_inner_req_list(model_type, inner_req_list):
-                    logger.warning(
-                        f"PayloadDrift: slot={drift['position']} "
-                        f"client={drift['client_value']!r} "
-                        f"chrome={drift['chrome_value']!r} "
-                        f"kind={drift['kind']} model={model_type} — "
-                        f"run 'python -m gemini_webapi.diag --model {model_type}' for full diff"
-                    )
 
             request_headers = {
                 **self._resolve_model_header(model, target_variant=target_variant),

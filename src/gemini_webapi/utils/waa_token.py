@@ -139,7 +139,6 @@ def _find_system_chrome() -> str | None:
 async def harvest_waa_token(
     cookies: Cookies,
     timeout: float = 45.0,
-    target_model: str | None = None,
 ) -> str:
     """Harvest a fresh WAA/BotGuard attestation token via Playwright.
 
@@ -257,85 +256,11 @@ async def harvest_waa_token(
             except Exception as e:
                 logger.debug(f"WAA harvester: model ID extraction failed: {e}")
 
-            # If caller requested a specific model, drive the mode picker
-            # BEFORE typing the warmup prompt so the StreamGenerate we
-            # intercept is the one for the target mode.
-            if target_model in ("pro", "flash", "thinking"):
-                try:
-                    await page.click(
-                        'button[aria-label="Open mode picker"]', timeout=5000
-                    )
-                    await page.wait_for_selector(
-                        '[role="menuitem"]', timeout=3000
-                    )
-                    label_for_click = {
-                        "pro": "Pro",
-                        "flash": "Fast",
-                        "thinking": "Thinking",
-                    }[target_model]
-                    clicked = await page.evaluate(
-                        """(label) => {
-                            const items = document.querySelectorAll('[role="menuitem"]');
-                            for (const el of items) {
-                                if (el.textContent.includes(label)) {
-                                    el.click();
-                                    return true;
-                                }
-                            }
-                            return false;
-                        }""",
-                        label_for_click,
-                    )
-                    if not clicked:
-                        logger.debug(
-                            f"WAA harvester: could not find menu item for target_model={target_model!r}"
-                        )
-                    else:
-                        # Wait for the mode-picker button label to reflect the
-                        # new selection. Note: even after the label updates,
-                        # the Gemini client's XHR-dispatch state may lag for
-                        # short prompts (Google appears to auto-route trivial
-                        # messages to a default mode), so the captured
-                        # reference may still resemble Flash for Pro/Thinking
-                        # targets. Drifts on slots shared across modes are
-                        # still caught; Pro-specific slots need DevTools
-                        # manual capture (see python -m gemini_webapi.diag).
-                        try:
-                            await page.wait_for_function(
-                                """(label) => {
-                                    const btn = document.querySelector(
-                                        'button[aria-label="Open mode picker"]'
-                                    );
-                                    return btn && btn.textContent.trim() === label;
-                                }""",
-                                arg=label_for_click,
-                                timeout=3000,
-                            )
-                        except Exception:
-                            logger.debug(
-                                f"WAA harvester: mode-picker label did not commit "
-                                f"to {label_for_click!r} within 3s"
-                            )
-                except Exception as e:
-                    logger.debug(
-                        f"WAA harvester: mode-picker click failed for target_model={target_model!r}: {e}"
-                    )
-
             # Type a trivial message and submit to trigger StreamGenerate.
-            # Use the Send button (not Enter) so the request picks up the
-            # currently-selected mode — Enter on a contenteditable div can
-            # route through a different code path that ignores the picker.
             logger.debug("WAA harvester: typing prompt to trigger StreamGenerate")
             await page.click(input_sel)
             await page.type(input_sel, "hi")
-            try:
-                await page.wait_for_selector(
-                    'button[aria-label*="Send"]', timeout=3000
-                )
-                await page.click('button[aria-label*="Send"]', timeout=3000)
-            except Exception:
-                # Fall back to Enter if the Send button is not reachable.
-                await page.keyboard.press("Enter")
+            await page.keyboard.press("Enter")
 
             # Wait for the token to be captured
             try:
