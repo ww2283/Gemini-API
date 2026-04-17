@@ -1091,6 +1091,7 @@ class GeminiClient(ChatMixin, GemMixin):
                     # configurable via GeminiClient.read_chat_delays / init().
                     read_chat_delays = self.read_chat_delays
                     all_stale = True  # Track if every attempt returned stale
+                    server_confirmed_failure = False  # ServerError [5] = drift fingerprint
                     for attempt, delay in enumerate(read_chat_delays, 1):
                         logger.warning(
                             f"Stream failed after Gemini assigned cid={chat.cid!r}. "
@@ -1128,6 +1129,7 @@ class GeminiClient(ChatMixin, GemMixin):
                             logger.debug(f"READ_CHAT attempt {attempt} returned None")
                         except ServerError:
                             all_stale = False
+                            server_confirmed_failure = True
                             logger.warning(
                                 f"READ_CHAT attempt {attempt}: server confirmed "
                                 f"generation failure. Skipping remaining attempts."
@@ -1154,6 +1156,31 @@ class GeminiClient(ChatMixin, GemMixin):
                             f"Stream failed for cid={chat.cid!r}. "
                             f"All {len(read_chat_delays)} READ_CHAT attempts returned stale "
                             f"response (rcid unchanged). Retrying stream."
+                        )
+                    if server_confirmed_failure:
+                        # Server returned batch-execute status [5] (gRPC INTERNAL)
+                        # on read_chat — it accepted the request but rejected the
+                        # generation. The known cause is x-goog-ext-525001261-jspb
+                        # header drift: non-null values in slots the current
+                        # Chrome sends as null trigger a server-side guard that
+                        # fires only on long streams. Surface as a drift error
+                        # so @running does not retry with the same broken header.
+                        raw_model_name = getattr(model, "model_name", model)
+                        model_name_str = (
+                            raw_model_name
+                            if isinstance(raw_model_name, str)
+                            else str(raw_model_name)
+                        )
+                        diag_alias = self._MODEL_TYPE_MAP.get(model_name_str, "pro")
+                        raise PayloadValidationError(
+                            f"Stream failed for cid={chat.cid!r} on model "
+                            f"{model_name_str!r}; server confirmed generation "
+                            "failure via batch-execute status [5]. This is "
+                            "the payload-drift fingerprint (typically the "
+                            "x-goog-ext-525001261-jspb header). Run "
+                            f"'python -m gemini_webapi.diag --model {diag_alias} "
+                            "--cdp-url http://localhost:9222' to diff against "
+                            "a live Chrome capture."
                         )
                     # Some attempts returned None/errors — turn may exist
                     # server-side. GeminiError prevents @running from retrying.
