@@ -125,9 +125,22 @@ def _launch_managed_chrome(headless: bool) -> subprocess.Popen | None:
     return None
 
 
-async def _capture_via_cdp(cdp_url: str, target_model: str) -> list | None:
+_TRACKED_HEADERS: tuple[str, ...] = (
+    "x-goog-ext-525001261-jspb",
+    "x-goog-ext-73010989-jspb",
+    "x-goog-ext-73010990-jspb",
+)
+
+
+async def _capture_via_cdp(
+    cdp_url: str, target_model: str
+) -> dict[str, Any] | None:
     """Connect to a Chrome at cdp_url and capture a StreamGenerate request
-    for target_model. Returns the captured inner_req_list or None.
+    for target_model.
+
+    Returns ``{"inner": list, "headers": {header_name: value}}`` on success
+    or ``None`` on failure. ``headers`` only includes values that were
+    present on the captured request; missing entries are omitted.
     """
     try:
         from playwright.async_api import async_playwright
@@ -135,7 +148,7 @@ async def _capture_via_cdp(cdp_url: str, target_model: str) -> list | None:
         print("diag: playwright not installed", file=sys.stderr)
         return None
 
-    captured: dict[str, Any] = {"inner": None}
+    captured: dict[str, Any] = {"inner": None, "headers": {}}
     captured_event = asyncio.Event()
 
     async def handle_route(route):
@@ -149,6 +162,13 @@ async def _capture_via_cdp(cdp_url: str, target_model: str) -> list | None:
                     and parsed["token"].startswith("!")
                 ):
                     captured["inner"] = parsed["reference_inner"]
+                    req_headers = route.request.headers or {}
+                    for hname in _TRACKED_HEADERS:
+                        value = req_headers.get(hname) or req_headers.get(
+                            hname.lower()
+                        )
+                        if value is not None:
+                            captured["headers"][hname] = value
                     captured_event.set()
         except Exception:
             pass
@@ -232,7 +252,9 @@ async def _capture_via_cdp(cdp_url: str, target_model: str) -> list | None:
         print(f"diag: CDP connection failed: {e}", file=sys.stderr)
         return None
 
-    return captured["inner"]
+    if captured["inner"] is None:
+        return None
+    return captured
 
 
 def _load_cookies(path: Path) -> Any:
@@ -277,6 +299,82 @@ def _diff_slots(
                     "kind": "value_mismatch",
                 }
             )
+    return entries
+
+
+def _parse_jspb_array(value: str) -> list | None:
+    """Parse a jspb header value as a JSON array. Returns None if malformed."""
+    try:
+        parsed = json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return parsed if isinstance(parsed, list) else None
+
+
+def _diff_headers(
+    model_enum: Model, captured: dict[str, str]
+) -> list[dict]:
+    """Diff the library's model headers against a Chrome capture.
+
+    For each tracked jspb header: if both sides parse as JSON arrays, reports
+    slot-by-slot mismatches. If only one side has a value or the values fail
+    to parse, reports the header-level mismatch.
+
+    The library-side model_id (slot 4 of the 525001261 header) is excluded
+    from the diff because the Model enum pins it to one of several valid
+    account-specific IDs and Chrome may have rotated to a different one.
+    """
+    lib_headers = model_enum.model_header
+    entries: list[dict] = []
+    for hname in _TRACKED_HEADERS:
+        lib_value = lib_headers.get(hname)
+        chrome_value = captured.get(hname)
+        if chrome_value is None:
+            # No Chrome reference for this header — skip silently rather
+            # than flagging drift. The fresh-launch harvester path never
+            # captures headers, so a missing value is not a bug.
+            continue
+        if lib_value is None:
+            entries.append(
+                {
+                    "header": hname,
+                    "client_value": None,
+                    "chrome_value": chrome_value,
+                    "kind": "missing_in_client",
+                }
+            )
+            continue
+        lib_slots = _parse_jspb_array(lib_value)
+        chrome_slots = _parse_jspb_array(chrome_value)
+        if lib_slots is None or chrome_slots is None:
+            if lib_value != chrome_value:
+                entries.append(
+                    {
+                        "header": hname,
+                        "client_value": lib_value,
+                        "chrome_value": chrome_value,
+                        "kind": "string_mismatch",
+                    }
+                )
+            continue
+        # Compare up to the longer length so missing trailing slots surface.
+        for position in range(max(len(lib_slots), len(chrome_slots))):
+            # Slot 4 is the account-specific model_id; any library pin for
+            # a valid account is legitimate so skip.
+            if hname == "x-goog-ext-525001261-jspb" and position == 4:
+                continue
+            l = lib_slots[position] if position < len(lib_slots) else None
+            r = chrome_slots[position] if position < len(chrome_slots) else None
+            if l != r:
+                entries.append(
+                    {
+                        "header": hname,
+                        "position": position,
+                        "client_value": l,
+                        "chrome_value": r,
+                        "kind": "slot_mismatch",
+                    }
+                )
     return entries
 
 
@@ -377,7 +475,20 @@ async def main(argv: list[str] | None = None) -> int:
 
     model_enum = _MODEL_ALIAS_TO_ENUM[args.model]
     reference_inner: list | None = None
+    reference_headers: dict[str, str] = {}
     managed_proc: subprocess.Popen | None = None
+
+    def _absorb_capture(capture: dict[str, Any] | None) -> list | None:
+        """Unpack CDP capture dict into module-local reference state."""
+        if capture is None:
+            return None
+        inner = capture.get("inner")
+        headers = capture.get("headers") or {}
+        if isinstance(headers, dict):
+            for k, v in headers.items():
+                if isinstance(v, str):
+                    reference_headers[k] = v
+        return inner if isinstance(inner, list) else None
 
     try:
         # Path A: external CDP first (maintainer has Chrome running with debug port).
@@ -386,7 +497,9 @@ async def main(argv: list[str] | None = None) -> int:
                 f"diag: connecting to external Chrome via CDP at {args.cdp_url}",
                 file=sys.stderr,
             )
-            reference_inner = await _capture_via_cdp(args.cdp_url, args.model)
+            reference_inner = _absorb_capture(
+                await _capture_via_cdp(args.cdp_url, args.model)
+            )
 
         # Path B: managed profile. Launch Chrome ourselves with a dedicated
         # port and user-data-dir, then connect via CDP.
@@ -409,8 +522,8 @@ async def main(argv: list[str] | None = None) -> int:
                 )
                 if managed_proc is not None:
                     managed_url = f"http://localhost:{_MANAGED_CDP_PORT}"
-                    reference_inner = await _capture_via_cdp(
-                        managed_url, args.model
+                    reference_inner = _absorb_capture(
+                        await _capture_via_cdp(managed_url, args.model)
                     )
 
         # Path C: fresh-launch fallback (Flash-only reliably).
@@ -423,7 +536,7 @@ async def main(argv: list[str] | None = None) -> int:
                 cookies = _Cookies()
             print(
                 "diag: falling back to fresh-launch harvester "
-                "(Pro/Thinking will likely capture as Flash)",
+                "(Pro/Thinking will likely capture as Flash, no headers)",
                 file=sys.stderr,
             )
             result = await harvest_waa_token(cookies)
@@ -433,27 +546,61 @@ async def main(argv: list[str] | None = None) -> int:
                     file=sys.stderr,
                 )
                 return 2
-            reference_inner = result[4]
+            harvested = result[4]
+            reference_inner = harvested if isinstance(harvested, list) else None
 
         if reference_inner is None:
             print("diag: no reference inner list captured.", file=sys.stderr)
             return 2
 
         built = build_diagnostic_inner_req_list(model_enum)
-        drifts = _diff_slots(built, reference_inner, _DIFF_EXCLUDED_SLOTS)
+        body_drifts = _diff_slots(built, reference_inner, _DIFF_EXCLUDED_SLOTS)
+        header_drifts = _diff_headers(model_enum, reference_headers)
 
-        if not drifts:
-            print(f"No drift detected for model={args.model}.")
-            return 0
+        any_drift = bool(body_drifts) or bool(header_drifts)
 
-        print(f"Drift detected for model={args.model}:")
-        for d in drifts:
+        if body_drifts:
+            print(f"Body drift detected for model={args.model}:")
+            for d in body_drifts:
+                print(
+                    f"  slot={d['position']} "
+                    f"client={d['client_value']!r} "
+                    f"chrome={d['chrome_value']!r} "
+                    f"kind={d['kind']}"
+                )
+
+        if header_drifts:
+            print(f"Header drift detected for model={args.model}:")
+            for d in header_drifts:
+                if d["kind"] == "slot_mismatch":
+                    print(
+                        f"  header={d['header']} slot={d['position']} "
+                        f"client={d['client_value']!r} "
+                        f"chrome={d['chrome_value']!r}"
+                    )
+                else:
+                    print(
+                        f"  header={d['header']} "
+                        f"client={d.get('client_value')!r} "
+                        f"chrome={d.get('chrome_value')!r} "
+                        f"kind={d['kind']}"
+                    )
+        elif reference_headers:
             print(
-                f"  slot={d['position']} "
-                f"client={d['client_value']!r} "
-                f"chrome={d['chrome_value']!r} "
-                f"kind={d['kind']}"
+                f"No header drift detected for model={args.model} "
+                f"(compared: {', '.join(sorted(reference_headers))})."
             )
+        else:
+            print(
+                f"No headers captured for model={args.model}; header diff "
+                "skipped (CDP capture required).",
+                file=sys.stderr,
+            )
+
+        if not any_drift:
+            if not body_drifts:
+                print(f"No drift detected for model={args.model}.")
+            return 0
         return 1
 
     finally:

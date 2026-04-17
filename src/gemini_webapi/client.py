@@ -111,7 +111,11 @@ def build_diagnostic_inner_req_list(
     jspb_str = model.model_header.get("x-goog-ext-525001261-jspb", "")
     if jspb_str:
         try:
-            inner_req_list[79] = json.loads(jspb_str)[11]
+            # Variant lives at jspb slot 14 in the current Chrome schema.
+            # Slot 11 used to carry a duplicate variant marker but is now
+            # null — do not fall back to it, a None value here would pin
+            # the probe to a variant Google rejects.
+            inner_req_list[79] = json.loads(jspb_str)[14]
         except Exception:
             pass
     return inner_req_list
@@ -247,7 +251,32 @@ class GeminiClient(ChatMixin, GemMixin):
 
                 result = await harvest_waa_token(self.cookies)
                 if isinstance(result, tuple):
-                    if len(result) == 5:
+                    if len(result) >= 6:
+                        (
+                            token,
+                            browser_version,
+                            model_ids,
+                            botguard_hash,
+                            reference_inner,
+                            reference_headers,
+                        ) = result[:6]
+                        if model_ids:
+                            self._discovered_model_ids = model_ids
+                        if reference_inner is not None:
+                            cache_key = target_model_type or "flash"
+                            try:
+                                self._reference_inner_req_lists[cache_key] = reference_inner
+                            except AttributeError:
+                                self._reference_inner_req_lists = {cache_key: reference_inner}
+                        if isinstance(reference_headers, dict) and reference_headers:
+                            try:
+                                from .utils.jspb_patch import apply_autopatch
+                                apply_autopatch(reference_headers)
+                            except Exception as patch_err:
+                                logger.debug(
+                                    f"jspb autopatch skipped: {patch_err}"
+                                )
+                    elif len(result) == 5:
                         token, browser_version, model_ids, botguard_hash, reference_inner = result
                         if model_ids:
                             self._discovered_model_ids = model_ids
@@ -1003,11 +1032,13 @@ class GeminiClient(ChatMixin, GemMixin):
             inner_req_list[61] = []
             inner_req_list[67] = 0
             inner_req_list[68] = 1
-            # Slot 79: model variant extracted from jspb header (position 11)
+            # Slot 79: model variant extracted from jspb header position 14.
+            # Chrome's current schema keeps variant only at slot 14; slot 11
+            # is null. See utils.jspb_patch for the canonical template.
             jspb_str = model.model_header.get("x-goog-ext-525001261-jspb", "")
             if jspb_str:
                 try:
-                    inner_req_list[79] = json.loads(jspb_str)[11]
+                    inner_req_list[79] = json.loads(jspb_str)[14]
                 except Exception:
                     pass
 
@@ -1091,6 +1122,7 @@ class GeminiClient(ChatMixin, GemMixin):
                     # configurable via GeminiClient.read_chat_delays / init().
                     read_chat_delays = self.read_chat_delays
                     all_stale = True  # Track if every attempt returned stale
+                    server_confirmed_failure = False  # ServerError [5] = drift fingerprint
                     for attempt, delay in enumerate(read_chat_delays, 1):
                         logger.warning(
                             f"Stream failed after Gemini assigned cid={chat.cid!r}. "
@@ -1128,6 +1160,7 @@ class GeminiClient(ChatMixin, GemMixin):
                             logger.debug(f"READ_CHAT attempt {attempt} returned None")
                         except ServerError:
                             all_stale = False
+                            server_confirmed_failure = True
                             logger.warning(
                                 f"READ_CHAT attempt {attempt}: server confirmed "
                                 f"generation failure. Skipping remaining attempts."
@@ -1154,6 +1187,31 @@ class GeminiClient(ChatMixin, GemMixin):
                             f"Stream failed for cid={chat.cid!r}. "
                             f"All {len(read_chat_delays)} READ_CHAT attempts returned stale "
                             f"response (rcid unchanged). Retrying stream."
+                        )
+                    if server_confirmed_failure:
+                        # Server returned batch-execute status [5] (gRPC INTERNAL)
+                        # on read_chat — it accepted the request but rejected the
+                        # generation. The known cause is x-goog-ext-525001261-jspb
+                        # header drift: non-null values in slots the current
+                        # Chrome sends as null trigger a server-side guard that
+                        # fires only on long streams. Surface as a drift error
+                        # so @running does not retry with the same broken header.
+                        raw_model_name = getattr(model, "model_name", model)
+                        model_name_str = (
+                            raw_model_name
+                            if isinstance(raw_model_name, str)
+                            else str(raw_model_name)
+                        )
+                        diag_alias = self._MODEL_TYPE_MAP.get(model_name_str, "pro")
+                        raise PayloadValidationError(
+                            f"Stream failed for cid={chat.cid!r} on model "
+                            f"{model_name_str!r}; server confirmed generation "
+                            "failure via batch-execute status [5]. This is "
+                            "the payload-drift fingerprint (typically the "
+                            "x-goog-ext-525001261-jspb header). Run "
+                            f"'python -m gemini_webapi.diag --model {diag_alias} "
+                            "--cdp-url http://localhost:9222' to diff against "
+                            "a live Chrome capture."
                         )
                     # Some attempts returned None/errors — turn may exist
                     # server-side. GeminiError prevents @running from retrying.
