@@ -330,15 +330,9 @@ def _diff_headers(
         lib_value = lib_headers.get(hname)
         chrome_value = captured.get(hname)
         if chrome_value is None:
-            if lib_value is not None:
-                entries.append(
-                    {
-                        "header": hname,
-                        "client_value": lib_value,
-                        "chrome_value": None,
-                        "kind": "not_captured",
-                    }
-                )
+            # No Chrome reference for this header — skip silently rather
+            # than flagging drift. The fresh-launch harvester path never
+            # captures headers, so a missing value is not a bug.
             continue
         if lib_value is None:
             entries.append(

@@ -172,7 +172,17 @@ async def harvest_waa_token(
     token: str | None = None
     botguard_hash: str | None = None
     reference_inner: list | None = None
+    reference_headers: dict[str, str] = {}
     token_event = asyncio.Event()
+
+    # Headers the drift detector and auto-patch care about. Captured from
+    # the same intercepted StreamGenerate request that yields the WAA token
+    # — no extra Chrome roundtrips.
+    _TRACKED_REQUEST_HEADERS: tuple[str, ...] = (
+        "x-goog-ext-525001261-jspb",
+        "x-goog-ext-73010989-jspb",
+        "x-goog-ext-73010990-jspb",
+    )
 
     async def _handle_route(route):
         nonlocal token, botguard_hash, reference_inner
@@ -189,6 +199,13 @@ async def harvest_waa_token(
                         if isinstance(hash_candidate, str):
                             botguard_hash = hash_candidate
                         reference_inner = parsed["reference_inner"]
+                        req_headers = request.headers or {}
+                        for hname in _TRACKED_REQUEST_HEADERS:
+                            value = req_headers.get(hname) or req_headers.get(
+                                hname.lower()
+                            )
+                            if isinstance(value, str):
+                                reference_headers[hname] = value
                         token_event.set()
         except Exception:
             pass
@@ -284,7 +301,14 @@ async def harvest_waa_token(
             except Exception:
                 pass
 
-            return token, browser_version, model_ids, botguard_hash, reference_inner
+            return (
+                token,
+                browser_version,
+                model_ids,
+                botguard_hash,
+                reference_inner,
+                reference_headers,
+            )
 
     except WAATokenError:
         raise
