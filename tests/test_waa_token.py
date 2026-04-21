@@ -1593,6 +1593,7 @@ class _FakePage:
         self._botguard_hash = botguard_hash
         self._reference_inner = reference_inner
         self._route_handler = None
+        self.close_called = False
 
     async def route(self, _pattern, handler):
         self._route_handler = handler
@@ -1617,6 +1618,9 @@ class _FakePage:
 
     async def unroute_all(self, **_kw):
         pass
+
+    async def close(self):
+        self.close_called = True
 
     @property
     def keyboard(self):
@@ -2444,6 +2448,318 @@ class TestHarvestDoesNotCloseUserOwnedCDPBrowser(
                 "harvester -- it belongs to the user. Calling close() "
                 "on it would terminate the user's entire Chrome session.",
             )
+
+
+# ---------------------------------------------------------------------------
+# R1 (this slate): CDP tab-leak + silent fresh-launch warning
+#
+# Two regressions surfaced after commit 891ff1b (per-model jspb template
+# capture, CDP-first resolution):
+#
+#   1. Tab leak on CDP path. waa_token.py closes the browser only when
+#      owns_browser=True. On the CDP path owns_browser=False, so the `page`
+#      opened via context.new_page() is never closed -- each generate_content
+#      accumulates a tab in the user's daily Chrome.
+#   2. Silent fresh-launch fallback for Pro/Thinking. When resolve_capture_path
+#      returns ("fresh", None), fresh Chrome cannot capture Pro/Thinking
+#      templates (aria-disabled without a real account sign-in). End users
+#      populate a Flash-only cache and Pro silently fails on drift. A
+#      logger.warning is needed with actionable remediation steps.
+#
+# The fixes are scoped to harvest_waa_token; template_capture.py is not
+# touched in this cycle.
+# ---------------------------------------------------------------------------
+
+
+class TestHarvestClosesPageOnCDPPath(unittest.IsolatedAsyncioTestCase):
+    """
+    R1-T1: On the CDP path the harvester did NOT own the browser, but it
+    DID own the page it created via ``contexts[0].new_page()``. Today the
+    finally block only closes the browser when owns_browser=True, so the
+    page leaks: every generate_content call accumulates a tab in the
+    user's daily Chrome. The fix is to always close the page at teardown
+    regardless of who owns the browser.
+
+    Re-asserts R7-A4 (browser stays open on CDP) as a belt to guarantee
+    the fix does not regress the "do not kill user's Chrome" invariant.
+
+    This test MUST FAIL today because harvest_waa_token never calls
+    page.close() on the CDP path.
+    """
+
+    async def test_page_closed_after_cdp_harvest(self):
+        import tempfile
+
+        from gemini_webapi.utils.waa_token import harvest_waa_token
+
+        with tempfile.TemporaryDirectory() as td:
+            cache_path = Path(td) / "jspb_templates.json"
+
+            cookies = Cookies()
+            cookies.set("__Secure-1PSID", "sid_x", domain=".google.com")
+
+            page, chromium, cdp_browser = _make_cdp_harness()
+            chromium._allow_launch = False  # CDP path only
+
+            mock_capture = AsyncMock(return_value=dict(_SAMPLE_TEMPLATES))
+
+            with patch(
+                "playwright.async_api.async_playwright",
+                _build_fake_playwright_cdp_factory(chromium),
+            ), patch(
+                "gemini_webapi.utils.waa_token.resolve_capture_path",
+                return_value=("cdp", "http://localhost:9222"),
+            ), patch(
+                "gemini_webapi.utils.waa_token.capture_all_models",
+                mock_capture,
+            ):
+                await harvest_waa_token(cookies, cache_path=cache_path)
+
+            # The page the harvester opened must be closed.
+            self.assertTrue(
+                page.close_called,
+                "page.close() must be called at teardown on the CDP path. "
+                "Without it the page leaks into the user's Chrome -- each "
+                "generate_content call accumulates a tab.",
+            )
+
+            # Belt: re-assert that the user-owned browser is NOT closed.
+            self.assertFalse(
+                cdp_browser.close_called,
+                "The fix for the page leak must NOT regress R7-A4: the "
+                "CDP-connected browser still belongs to the user and must "
+                "not be closed.",
+            )
+
+
+class TestHarvestClosesPageOnFreshPath(unittest.IsolatedAsyncioTestCase):
+    """
+    R1-T2: On the fresh-launch path, browser.close() transitively closes
+    any pages Playwright opened under it, so a leaked page is not a
+    user-visible symptom today. Even so, explicit page.close() is cheap
+    insurance and makes the harvester's teardown contract uniform across
+    paths -- easier to audit, less fragile if Playwright ever changes its
+    transitive-close semantics.
+
+    This test MUST FAIL today because harvest_waa_token never calls
+    page.close() on any path.
+    """
+
+    async def test_page_closed_after_fresh_harvest(self):
+        import tempfile
+
+        from gemini_webapi.utils.waa_token import harvest_waa_token
+
+        with tempfile.TemporaryDirectory() as td:
+            cache_path = Path(td) / "jspb_templates.json"
+
+            cookies = Cookies()
+            cookies.set("__Secure-1PSID", "sid_x", domain=".google.com")
+
+            page, chromium, _ = _make_cdp_harness()
+            chromium._allow_cdp = False  # fresh-launch path only
+
+            mock_capture = AsyncMock(return_value=dict(_SAMPLE_TEMPLATES))
+
+            with patch(
+                "playwright.async_api.async_playwright",
+                _build_fake_playwright_cdp_factory(chromium),
+            ), patch(
+                "gemini_webapi.utils.waa_token.resolve_capture_path",
+                return_value=("fresh", None),
+            ), patch(
+                "gemini_webapi.utils.waa_token.capture_all_models",
+                mock_capture,
+            ):
+                await harvest_waa_token(cookies, cache_path=cache_path)
+
+            self.assertTrue(
+                page.close_called,
+                "page.close() must be called at teardown on the "
+                "fresh-launch path too. Symmetry with the CDP path keeps "
+                "the teardown contract uniform and easier to audit.",
+            )
+
+
+class TestHarvestWarnsOnFreshPathWithIncompletePro(
+    unittest.IsolatedAsyncioTestCase
+):
+    """
+    R1-T3: When the harvester is forced onto the fresh-launch path and
+    ``capture_all_models`` returns a dict missing Pro (or Thinking), the
+    user has no visibility into why Pro will silently fail on the next
+    drift check. Fresh Chrome renders the Pro/Thinking mode buttons as
+    aria-disabled because those entitlements require the user's real
+    Google account sign-in state (Default/Login Data For Account file).
+
+    The harvester must emit a ``logger.warning`` telling the user how to
+    unlock Pro/Thinking capture: either run the managed-profile setup
+    (``python -m gemini_webapi.diag --setup``) or start their daily
+    Chrome with ``--remote-debugging-port=9222`` so the CDP path is
+    selected instead.
+
+    This test MUST FAIL today because the warning does not exist yet.
+    """
+
+    async def test_warning_when_fresh_and_pro_missing(self):
+        import tempfile
+
+        from loguru import logger
+
+        from gemini_webapi.utils.waa_token import harvest_waa_token
+
+        with tempfile.TemporaryDirectory() as td:
+            cache_path = Path(td) / "jspb_templates.json"
+
+            cookies = Cookies()
+            cookies.set("__Secure-1PSID", "sid_x", domain=".google.com")
+
+            page, chromium, _ = _make_cdp_harness()
+            chromium._allow_cdp = False  # fresh-launch path only
+
+            # Simulate the aria-disabled fallback: only Flash captured.
+            incomplete_templates = {"flash": _SAMPLE_TEMPLATES["flash"]}
+            mock_capture = AsyncMock(return_value=incomplete_templates)
+
+            records: list = []
+            handler_id = logger.add(
+                lambda msg: records.append(msg.record), level="WARNING"
+            )
+            try:
+                with patch(
+                    "playwright.async_api.async_playwright",
+                    _build_fake_playwright_cdp_factory(chromium),
+                ), patch(
+                    "gemini_webapi.utils.waa_token.resolve_capture_path",
+                    return_value=("fresh", None),
+                ), patch(
+                    "gemini_webapi.utils.waa_token.capture_all_models",
+                    mock_capture,
+                ):
+                    await harvest_waa_token(cookies, cache_path=cache_path)
+            finally:
+                logger.remove(handler_id)
+
+            warning_records = [
+                r for r in records if r["level"].name == "WARNING"
+            ]
+            self.assertTrue(
+                warning_records,
+                "harvest_waa_token must emit at least one WARNING when "
+                "the fresh-launch path yields templates missing Pro. "
+                "Users need actionable guidance, not silent failure.",
+            )
+
+            # At least one warning must mention both "Pro" (the affected
+            # capability) and "--setup" (the canonical remediation).
+            # Green phase has wording flexibility around these anchors.
+            relevant = [
+                r for r in warning_records
+                if "Pro" in r["message"] and "--setup" in r["message"]
+            ]
+            self.assertTrue(
+                relevant,
+                "A WARNING record must mention both 'Pro' and '--setup' "
+                "so the user can act on it. Got messages: "
+                f"{[r['message'] for r in warning_records]!r}",
+            )
+
+
+class TestHarvestDoesNotWarnWhenCacheComplete(
+    unittest.IsolatedAsyncioTestCase
+):
+    """
+    R1-T4: The "fresh-path Pro-missing" warning is strictly conditional --
+    it must NOT fire when:
+      (a) the CDP path ran (capture has full sign-in state, Pro is fine), or
+      (b) the fresh path captured all three templates anyway (happy case,
+          no cause for alarm).
+
+    Without this guard the warning becomes noise and users start ignoring
+    it, defeating its purpose.
+
+    This test is currently expected to pass vacuously (no warning emitted
+    ever today), but it pins the contract that Green must preserve.
+    """
+
+    async def _run_harvest_and_capture_warnings(
+        self, *, path: str, templates: dict
+    ) -> list:
+        import tempfile
+
+        from loguru import logger
+
+        from gemini_webapi.utils.waa_token import harvest_waa_token
+
+        with tempfile.TemporaryDirectory() as td:
+            cache_path = Path(td) / "jspb_templates.json"
+
+            cookies = Cookies()
+            cookies.set("__Secure-1PSID", "sid_x", domain=".google.com")
+
+            page, chromium, _ = _make_cdp_harness()
+            if path == "cdp":
+                chromium._allow_launch = False
+                resolve_return = ("cdp", "http://localhost:9222")
+            else:
+                chromium._allow_cdp = False
+                resolve_return = ("fresh", None)
+
+            mock_capture = AsyncMock(return_value=dict(templates))
+
+            records: list = []
+            handler_id = logger.add(
+                lambda msg: records.append(msg.record), level="WARNING"
+            )
+            try:
+                with patch(
+                    "playwright.async_api.async_playwright",
+                    _build_fake_playwright_cdp_factory(chromium),
+                ), patch(
+                    "gemini_webapi.utils.waa_token.resolve_capture_path",
+                    return_value=resolve_return,
+                ), patch(
+                    "gemini_webapi.utils.waa_token.capture_all_models",
+                    mock_capture,
+                ):
+                    await harvest_waa_token(cookies, cache_path=cache_path)
+            finally:
+                logger.remove(handler_id)
+
+        return [r for r in records if r["level"].name == "WARNING"]
+
+    async def test_no_warning_when_cdp_or_cache_complete(self):
+        # Subcase (a): CDP path with full templates -- no warning.
+        cdp_warnings = await self._run_harvest_and_capture_warnings(
+            path="cdp", templates=dict(_SAMPLE_TEMPLATES)
+        )
+        fresh_path_warnings = [
+            r for r in cdp_warnings
+            if "Pro" in r["message"] and "--setup" in r["message"]
+        ]
+        self.assertEqual(
+            fresh_path_warnings,
+            [],
+            "The fresh-path/Pro-missing WARNING must NOT fire on the "
+            "CDP path. CDP means the user has full sign-in state; "
+            "Pro capture is not at risk.",
+        )
+
+        # Subcase (b): Fresh path but complete capture -- no warning.
+        fresh_warnings = await self._run_harvest_and_capture_warnings(
+            path="fresh", templates=dict(_SAMPLE_TEMPLATES)
+        )
+        fresh_path_warnings = [
+            r for r in fresh_warnings
+            if "Pro" in r["message"] and "--setup" in r["message"]
+        ]
+        self.assertEqual(
+            fresh_path_warnings,
+            [],
+            "The fresh-path/Pro-missing WARNING must NOT fire when the "
+            "fresh launch captured all three templates. The warning is "
+            "strictly for the incomplete-capture condition.",
+        )
 
 
 if __name__ == "__main__":

@@ -551,6 +551,40 @@ set_log_level("DEBUG")
 >
 > Calling `set_log_level` for the first time will **globally** remove all existing loguru handlers. You may want to configure logging directly with loguru to avoid this issue and have more advanced control over logging behaviors.
 
+## Pro / Thinking Model Capture (v2 branch)
+
+The WAA harvester needs Chrome's per-model jspb request templates to keep Pro and Thinking requests correctly fingerprinted. Internally it resolves a capture path in three tiers:
+
+1. **CDP** — reuse an already-running Chrome on a debug port.
+2. **Managed profile** — a dedicated isolated Chrome under `~/.cache/gemini_webapi/chrome_profile` that persists your sign-in.
+3. **Fresh-launch** — a bare Playwright Chromium with no sign-in state.
+
+Only tiers 1 and 2 can capture Pro and Thinking templates. A fresh-launch Chrome sees those mode buttons rendered as `aria-disabled` because the entitlements require your real Google account sign-in state, so the harvester falls back to Flash-only. When that happens you will see a `WARNING` log telling you which templates are missing and how to unlock them.
+
+### Unlock path A — you already run Chrome with a debug port
+
+If you already launch your daily Chrome with `--remote-debugging-port=9222` (for example because you use `chrome-devtools-mcp`), there is nothing to configure: the harvester auto-discovers the endpoint and reuses your signed-in context. Pro and Thinking capture work on the first `generate_content` call.
+
+### Unlock path B — one-time managed-profile setup
+
+If you do not run Chrome with a debug port, run the diag `--setup` once to seed the managed profile:
+
+```sh
+python -m gemini_webapi.diag --setup
+```
+
+This launches a visible isolated Chrome against `~/.cache/gemini_webapi/chrome_profile` at `gemini.google.com/app`. Sign in with your Google account and close the window. The profile persists, and future harvests reuse it to capture Pro and Thinking templates.
+
+### Custom CDP endpoint
+
+To point the harvester at a non-default CDP endpoint, set `GEMINI_WAA_CHROME_URL`:
+
+```sh
+export GEMINI_WAA_CHROME_URL=http://localhost:9222
+```
+
+The harvester will forward this URL to the capture-path resolver. If the probe succeeds the CDP path is selected; otherwise it falls back to the managed profile and finally to fresh-launch.
+
 ## References
 
 [Google AI Studio](https://ai.google.dev/tutorials/ai-studio_quickstart)

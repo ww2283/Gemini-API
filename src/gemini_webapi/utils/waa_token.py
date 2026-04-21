@@ -258,6 +258,7 @@ async def harvest_waa_token(
 
     browser = None
     owns_browser = False
+    page = None
     try:
         async with async_playwright() as p:
             if source == "cdp":
@@ -391,6 +392,26 @@ async def harvest_waa_token(
                             f"jspb_cache.write_cache failed: {write_err}"
                         )
 
+            # Warn when the fresh-launch path produced an incomplete
+            # per-model template set. Fresh Chrome cannot capture
+            # Pro/Thinking (aria-disabled without real account sign-in),
+            # so the user needs actionable guidance to unlock them.
+            if source == "fresh" and per_model_templates is not None:
+                missing = [
+                    m for m in ("pro", "thinking")
+                    if m not in per_model_templates
+                ]
+                if missing:
+                    logger.warning(
+                        "WAA harvester on fresh-launch path: "
+                        f"{'/'.join(m.capitalize() for m in missing)} "
+                        "template(s) not captured (mode buttons "
+                        "aria-disabled without account sign-in). Run "
+                        "`python -m gemini_webapi.diag --setup` or start "
+                        "Chrome with --remote-debugging-port=9222 to "
+                        "unlock Pro/Thinking capture."
+                    )
+
             return (
                 token,
                 browser_version,
@@ -406,5 +427,10 @@ async def harvest_waa_token(
     except Exception as e:
         raise WAATokenError(f"Token harvesting failed: {e}") from e
     finally:
+        if page is not None:
+            try:
+                await page.close()
+            except Exception:
+                pass
         if browser and owns_browser:
             await browser.close()
