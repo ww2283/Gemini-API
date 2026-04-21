@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import platform
 import re
 import shutil
@@ -24,6 +25,10 @@ from typing import TYPE_CHECKING
 from urllib.parse import parse_qs
 
 from loguru import logger
+
+from . import jspb_cache
+from .capture_path import resolve_capture_path
+from .template_capture import capture_all_models
 
 # RPC names embedded in Gemini's server-side experiment data that contain
 # model ID arrays.  These map each "mode" (Fast / Thinking / Pro) to an
@@ -139,18 +144,23 @@ def _find_system_chrome() -> str | None:
 async def harvest_waa_token(
     cookies: Cookies,
     timeout: float = 45.0,
-) -> str:
+    cache_path: Path | None = None,
+) -> tuple:
     """Harvest a fresh WAA/BotGuard attestation token via Playwright.
 
     Args:
         cookies: httpx Cookies jar with Google authentication cookies.
         timeout: Maximum time in seconds to wait for token extraction.
+        cache_path: Override path for the per-model jspb templates cache. If
+            ``None``, the default cache location is used. If the cache is
+            fresh, the per-model capture loop is skipped entirely.
 
     Returns:
-        Tuple of (token, browser_version, model_ids, botguard_hash, reference_inner)
-        where token starts with '!' (~1.3KB), browser_version is e.g.
-        '146.0.7680.178', and reference_inner is the full decoded inner_req_list
-        captured from the intercepted StreamGenerate request.
+        7-tuple of (token, browser_version, model_ids, botguard_hash,
+        reference_inner, reference_headers, per_model_templates) where
+        ``per_model_templates`` is either the cached templates dict (on
+        cache hit) or the result of ``capture_all_models`` (on cache
+        miss/stale). ``None`` if capture produced nothing.
 
     Raises:
         WAATokenError: If token harvesting fails for any reason.
@@ -169,6 +179,17 @@ async def harvest_waa_token(
     if not pw_cookies:
         raise WAATokenError("No cookies available for WAA token harvesting")
 
+    # Consult jspb cache; on fresh hit, skip the per-model capture loop.
+    cached_templates: dict[str, str] | None = None
+    try:
+        cache_entry = jspb_cache.read_cache(path=cache_path)
+    except Exception:
+        cache_entry = None
+    if cache_entry is not None:
+        templates = cache_entry.get("templates")
+        if isinstance(templates, dict):
+            cached_templates = dict(templates)
+
     token: str | None = None
     botguard_hash: str | None = None
     reference_inner: list | None = None
@@ -184,71 +205,117 @@ async def harvest_waa_token(
         "x-goog-ext-73010990-jspb",
     )
 
-    async def _handle_route(route):
+    def _extract_from_request(request) -> bool:
         nonlocal token, botguard_hash, reference_inner
+        if token_event.is_set():
+            return True
         try:
-            request = route.request
+            url = getattr(request, "url", None)
+            if isinstance(url, str) and url and "/StreamGenerate" not in url:
+                return False
             post_data = request.post_data
-            if post_data:
-                parsed = _parse_stream_generate_request(post_data)
-                if parsed is not None:
-                    candidate = parsed["token"]
-                    if isinstance(candidate, str) and candidate.startswith("!"):
-                        token = candidate
-                        hash_candidate = parsed["botguard_hash"]
-                        if isinstance(hash_candidate, str):
-                            botguard_hash = hash_candidate
-                        reference_inner = parsed["reference_inner"]
-                        req_headers = request.headers or {}
-                        for hname in _TRACKED_REQUEST_HEADERS:
-                            value = req_headers.get(hname) or req_headers.get(
-                                hname.lower()
-                            )
-                            if isinstance(value, str):
-                                reference_headers[hname] = value
-                        token_event.set()
+            if not post_data:
+                return False
+            parsed = _parse_stream_generate_request(post_data)
+            if parsed is None:
+                return False
+            candidate = parsed["token"]
+            if not (isinstance(candidate, str) and candidate.startswith("!")):
+                return False
+            token = candidate
+            hash_candidate = parsed["botguard_hash"]
+            if isinstance(hash_candidate, str):
+                botguard_hash = hash_candidate
+            reference_inner = parsed["reference_inner"]
+            req_headers = request.headers or {}
+            for hname in _TRACKED_REQUEST_HEADERS:
+                value = req_headers.get(hname) or req_headers.get(hname.lower())
+                if isinstance(value, str):
+                    reference_headers[hname] = value
+            token_event.set()
+            return True
+        except Exception:
+            return False
+
+    async def _handle_route(route):
+        try:
+            _extract_from_request(route.request)
         except Exception:
             pass
         await route.abort()
 
+    def _handle_request(request):
+        _extract_from_request(request)
+
+    # Resolve capture transport BEFORE entering playwright context. The CDP
+    # path reuses an already-running user Chrome (signed-in state available
+    # for Pro/Thinking); the fresh-launch path keeps today's behaviour.
+    cdp_url_override = os.environ.get("GEMINI_WAA_CHROME_URL")
+    source, url_or_path = resolve_capture_path(
+        cdp_url_override=cdp_url_override,
+        managed_profile_path=None,
+    )
+
     browser = None
+    owns_browser = False
     try:
         async with async_playwright() as p:
-            # Try channel="chrome" first (uses system Chrome, no download)
-            launch_kwargs = dict(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage"],
-            )
-            try:
-                logger.debug("WAA harvester: launching Chrome (channel=chrome)")
-                browser = await p.chromium.launch(channel="chrome", **launch_kwargs)
-            except Exception as launch_err:
-                logger.debug(f"WAA harvester: channel=chrome failed: {launch_err}")
-                # Fallback: explicit path
-                chrome_path = _find_system_chrome()
-                if chrome_path:
-                    logger.debug(f"Falling back to system Chrome at {chrome_path}")
-                    browser = await p.chromium.launch(
-                        executable_path=chrome_path, **launch_kwargs
-                    )
+            if source == "cdp":
+                logger.debug(
+                    f"WAA harvester: connecting over CDP at {url_or_path}"
+                )
+                browser = await p.chromium.connect_over_cdp(url_or_path)
+                if browser.contexts:
+                    context = browser.contexts[0]
                 else:
-                    raise WAATokenError(
-                        "System Chrome not found. Install Google Chrome or run "
-                        "'playwright install chromium' to download a bundled browser."
-                    )
-
-            context = await browser.new_context()
-            # Add cookies one-by-one to skip any that Playwright rejects
-            for cookie in pw_cookies:
+                    context = await browser.new_context()
+                owns_browser = False
+                # Skip cookie injection — the user's Chrome already carries
+                # valid sign-in state.
+            else:
+                # Try channel="chrome" first (uses system Chrome, no download)
+                launch_kwargs = dict(
+                    headless=True,
+                    args=["--no-sandbox", "--disable-dev-shm-usage"],
+                )
                 try:
-                    await context.add_cookies([cookie])
-                except Exception:
-                    pass  # Skip invalid cookies silently
+                    logger.debug("WAA harvester: launching Chrome (channel=chrome)")
+                    browser = await p.chromium.launch(channel="chrome", **launch_kwargs)
+                except Exception as launch_err:
+                    logger.debug(f"WAA harvester: channel=chrome failed: {launch_err}")
+                    # Fallback: explicit path
+                    chrome_path = _find_system_chrome()
+                    if chrome_path:
+                        logger.debug(f"Falling back to system Chrome at {chrome_path}")
+                        browser = await p.chromium.launch(
+                            executable_path=chrome_path, **launch_kwargs
+                        )
+                    else:
+                        raise WAATokenError(
+                            "System Chrome not found. Install Google Chrome or run "
+                            "'playwright install chromium' to download a bundled browser."
+                        )
+                owns_browser = True
+
+                context = await browser.new_context()
+                # Add cookies one-by-one to skip any that Playwright rejects
+                for cookie in pw_cookies:
+                    try:
+                        await context.add_cookies([cookie])
+                    except Exception:
+                        pass  # Skip invalid cookies silently
 
             page = await context.new_page()
 
-            # Intercept StreamGenerate to extract the WAA token
+            # Intercept StreamGenerate to extract the WAA token.
+            # ``page.route`` blocks the request but is unreliable on
+            # CDP-connected contexts. ``page.on('request')`` is an observer
+            # that fires on both fresh-launch and CDP contexts.
             await page.route("**/StreamGenerate*", _handle_route)
+            try:
+                page.on("request", _handle_request)
+            except Exception:
+                pass
 
             # Navigate to Gemini — use domcontentloaded because networkidle
             # never fires (Gemini keeps persistent WebSocket/polling connections)
@@ -301,6 +368,29 @@ async def harvest_waa_token(
             except Exception:
                 pass
 
+            # Per-model jspb template capture: only run on cache miss/stale.
+            # On a fresh cache hit, reuse the cached templates to skip the
+            # expensive mode-switch loop (~30s for 3 models).
+            per_model_templates: dict[str, str] | None = cached_templates
+            if cached_templates is None:
+                try:
+                    captured = await capture_all_models(page)
+                except Exception as capture_err:
+                    logger.debug(
+                        f"per-model jspb capture failed: {capture_err}"
+                    )
+                    captured = None
+                if captured:
+                    per_model_templates = captured
+                    try:
+                        jspb_cache.write_cache(
+                            captured, source="fresh", path=cache_path
+                        )
+                    except Exception as write_err:
+                        logger.debug(
+                            f"jspb_cache.write_cache failed: {write_err}"
+                        )
+
             return (
                 token,
                 browser_version,
@@ -308,6 +398,7 @@ async def harvest_waa_token(
                 botguard_hash,
                 reference_inner,
                 reference_headers,
+                per_model_templates,
             )
 
     except WAATokenError:
@@ -315,5 +406,5 @@ async def harvest_waa_token(
     except Exception as e:
         raise WAATokenError(f"Token harvesting failed: {e}") from e
     finally:
-        if browser:
+        if browser and owns_browser:
             await browser.close()

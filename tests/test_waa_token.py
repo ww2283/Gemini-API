@@ -1528,5 +1528,923 @@ class TestDiagCliExitCodes(unittest.IsolatedAsyncioTestCase):
         )
 
 
+# ---------------------------------------------------------------------------
+# R5: Client-side plumbing for per-model jspb template cache (Phase 5)
+#
+# The R1-R4 green phases built:
+#   - jspb_cache.read_cache / write_cache / invalidate_cache (G1)
+#   - jspb_patch.apply_autopatch(dict[str, str]) (G2)
+#   - capture_path.resolve_capture_path / probe_cdp_url (G3)
+#   - template_capture.capture_all_models (G4)
+#
+# R5 stitches these into the runtime:
+#   A. harvest_waa_token is cache-aware. When the on-disk cache is fresh
+#      it SKIPS the per-model capture loop (capture_all_models is NOT
+#      called). When stale or absent it runs the full capture and writes
+#      the result to disk via jspb_cache.write_cache.
+#   B. harvest_waa_token's return tuple grows from 6 to 7 elements; the
+#      new trailing element is the per-model templates dict (or None when
+#      capture failed).
+#   C. _generate's raise site for PayloadValidationError invalidates the
+#      jspb cache immediately before raising so the next request forces a
+#      recapture (the 1h debounce inside invalidate_cache handles abuse).
+#
+# These tests MUST FAIL today:
+#   - harvest_waa_token currently returns a 6-tuple with no templates.
+#   - harvest_waa_token does not touch jspb_cache at all.
+#   - _generate raises PayloadValidationError without calling
+#     jspb_cache.invalidate_cache.
+# ---------------------------------------------------------------------------
+
+
+from pathlib import Path
+
+
+# ---- Fake async_playwright chain ------------------------------------------
+#
+# The harvester's body is ~100 lines of Playwright orchestration: launch
+# browser, open context, install cookies, register route, navigate, wait
+# for input, type prompt, press Enter, await the token_event.  Mocking each
+# step individually is brittle; a single source of truth fake that
+# implements the subset of the async API the harvester touches keeps the
+# tests readable and maintainable.
+#
+# The fake implements ONLY the shape harvest_waa_token uses today -- if
+# G5 changes the body, the fake's surface may need a trivial extension
+# (add a method stub that returns an AsyncMock).  Everything async is
+# trivially awaitable.
+
+
+class _FakeRoute:
+    def __init__(self, post_data: str, headers: dict[str, str]):
+        self.request = MagicMock()
+        self.request.post_data = post_data
+        self.request.headers = headers
+
+    async def abort(self):
+        pass
+
+
+class _FakePage:
+    """A Playwright page that synthesises one StreamGenerate request."""
+
+    def __init__(self, *, token: str, botguard_hash: str, reference_inner: list):
+        self._token = token
+        self._botguard_hash = botguard_hash
+        self._reference_inner = reference_inner
+        self._route_handler = None
+
+    async def route(self, _pattern, handler):
+        self._route_handler = handler
+
+    async def goto(self, *_a, **_kw):
+        pass
+
+    async def wait_for_selector(self, *_a, **_kw):
+        pass
+
+    async def content(self):
+        return "<html></html>"
+
+    async def click(self, *_a, **_kw):
+        pass
+
+    async def type(self, *_a, **_kw):
+        pass
+
+    async def evaluate(self, *_a, **_kw):
+        return ""
+
+    async def unroute_all(self, **_kw):
+        pass
+
+    @property
+    def keyboard(self):
+        kb = MagicMock()
+        kb.press = AsyncMock(side_effect=self._fire_route)
+        return kb
+
+    async def _fire_route(self, *_a, **_kw):
+        """Simulate StreamGenerate firing once the prompt is submitted."""
+        if self._route_handler is None:
+            return
+        inner = self._reference_inner
+        post_data = _build_post_data(inner)
+        fake_route = _FakeRoute(
+            post_data=post_data,
+            headers={
+                "x-goog-ext-525001261-jspb": "[1,null,null,null,\"aaaaaaaaaaaaaaaa\",null,null,0,[4],null,null,3,null,null,1]",
+            },
+        )
+        await self._route_handler(fake_route)
+
+
+class _FakeBrowser:
+    def __init__(self, page: _FakePage):
+        self._page = page
+        self.version = "146.0.7680.178"
+
+    async def new_context(self):
+        ctx = MagicMock()
+        ctx.add_cookies = AsyncMock()
+        ctx.new_page = AsyncMock(return_value=self._page)
+        return ctx
+
+    async def close(self):
+        pass
+
+
+class _FakeChromium:
+    def __init__(self, page: _FakePage):
+        self._page = page
+
+    async def launch(self, **_kw):
+        return _FakeBrowser(self._page)
+
+
+class _FakePlaywrightCtx:
+    def __init__(self, page: _FakePage):
+        self.chromium = _FakeChromium(page)
+
+
+class _FakeAsyncPlaywright:
+    """Stand-in for playwright.async_api.async_playwright()."""
+
+    def __init__(self, page: _FakePage):
+        self._page = page
+
+    async def __aenter__(self):
+        return _FakePlaywrightCtx(self._page)
+
+    async def __aexit__(self, *_a):
+        return False
+
+
+def _build_fake_playwright_factory(page: _FakePage):
+    """Patchable replacement for `async_playwright` symbol."""
+    def _factory():
+        return _FakeAsyncPlaywright(page)
+    return _factory
+
+
+def _sample_reference_inner() -> list:
+    inner: list[Any] = [None] * 80
+    inner[3] = "!sample_waa_token_xxxxxxxxxxxxxxxxxxxx"
+    inner[4] = "deadbeefdeadbeef" * 2  # 32 chars
+    inner[67] = 0
+    return inner
+
+
+_SAMPLE_TEMPLATES: dict[str, str] = {
+    "flash": "[1,null,null,null,\"56fdd199312815e2\",null,null,0,[4],null,null,3,null,null,1]",
+    "pro":   "[1,null,null,null,\"797f3d0293f288ad\",null,null,0,[4],null,null,3,null,null,3,1]",
+    "thinking": "[1,null,null,null,\"56fdd199312815e2\",null,null,0,[4],null,null,3,null,null,1]",
+}
+
+
+def _patch_playwright_for_harvest():
+    """Return a patcher for ``playwright.async_api.async_playwright``.
+
+    Callers use::
+
+        with _patch_playwright_for_harvest() as page:
+            ...
+
+    The yielded ``page`` is the same _FakePage the harvester will drive,
+    in case the test wants to pre-seed its state.
+    """
+    inner = _sample_reference_inner()
+    page = _FakePage(
+        token="!sample_waa_token_xxxxxxxxxxxxxxxxxxxx",
+        botguard_hash="deadbeefdeadbeef" * 2,
+        reference_inner=inner,
+    )
+    factory = _build_fake_playwright_factory(page)
+    return patch("playwright.async_api.async_playwright", factory)
+
+
+class TestHarvestWritesTemplatesToCacheOnFullCapture(
+    unittest.IsolatedAsyncioTestCase
+):
+    """
+    R5-A1: On cache miss, harvest_waa_token must:
+      - Invoke capture_all_models to build the per-model template dict.
+      - Persist that dict via jspb_cache.write_cache under the cache_path
+        injected into the call (so tests can observe it without touching
+        ~/.cache).
+
+    This test will FAIL today because:
+      - harvest_waa_token takes no cache_path kwarg.
+      - harvest_waa_token does not call capture_all_models at all.
+      - harvest_waa_token does not call jspb_cache.write_cache.
+    """
+
+    async def test_full_capture_writes_templates_to_cache(self):
+        import tempfile
+
+        from gemini_webapi.utils import jspb_cache
+        from gemini_webapi.utils.waa_token import harvest_waa_token
+
+        with tempfile.TemporaryDirectory() as td:
+            cache_path = Path(td) / "jspb_templates.json"
+
+            cookies = Cookies()
+            cookies.set("__Secure-1PSID", "sid_x", domain=".google.com")
+
+            # Cache does not exist yet -> full capture branch.
+            self.assertFalse(cache_path.exists())
+
+            mock_capture = AsyncMock(return_value=dict(_SAMPLE_TEMPLATES))
+
+            with _patch_playwright_for_harvest(), patch(
+                "gemini_webapi.utils.waa_token.capture_all_models",
+                mock_capture,
+            ):
+                await harvest_waa_token(cookies, cache_path=cache_path)
+
+            # capture_all_models was invoked (full-capture branch taken).
+            self.assertEqual(
+                mock_capture.await_count,
+                1,
+                "capture_all_models must run on cache miss so templates "
+                "are refreshed.",
+            )
+
+            # The cache file exists and contains the captured templates.
+            self.assertTrue(
+                cache_path.exists(),
+                "write_cache must persist captured templates to the "
+                "injected cache_path.",
+            )
+            cached = jspb_cache.read_cache(path=cache_path)
+            self.assertIsNotNone(cached)
+            self.assertEqual(cached["templates"], _SAMPLE_TEMPLATES)
+
+
+class TestHarvestReadsFreshCacheAndSkipsPerModelCapture(
+    unittest.IsolatedAsyncioTestCase
+):
+    """
+    R5-A2: On cache hit (fresh), harvest_waa_token must NOT call
+    capture_all_models. The per-model loop is expensive (3 mode switches
+    + 3 prompt submissions, ~30s) and the whole point of caching is to
+    skip that work when templates are still valid.
+
+    This test will FAIL today because harvest_waa_token ignores the cache
+    entirely -- it will attempt to launch a browser and run capture.
+    """
+
+    async def test_fresh_cache_skips_capture_all_models(self):
+        import tempfile
+
+        from gemini_webapi.utils import jspb_cache
+        from gemini_webapi.utils.waa_token import harvest_waa_token
+
+        with tempfile.TemporaryDirectory() as td:
+            cache_path = Path(td) / "jspb_templates.json"
+
+            cookies = Cookies()
+            cookies.set("__Secure-1PSID", "sid_x", domain=".google.com")
+
+            # Pre-populate the cache with fresh templates (captured_at=now).
+            jspb_cache.write_cache(
+                _SAMPLE_TEMPLATES, source="test", path=cache_path
+            )
+            self.assertIsNotNone(jspb_cache.read_cache(path=cache_path))
+
+            # If capture_all_models is called, fail loudly. The cache was
+            # fresh, so the full loop MUST be skipped.
+            mock_capture = AsyncMock(
+                side_effect=AssertionError(
+                    "capture_all_models must NOT be called when cache is fresh"
+                )
+            )
+
+            with _patch_playwright_for_harvest(), patch(
+                "gemini_webapi.utils.waa_token.capture_all_models",
+                mock_capture,
+            ):
+                # Must not raise -- the cache branch bypasses capture.
+                await harvest_waa_token(cookies, cache_path=cache_path)
+
+            self.assertEqual(mock_capture.await_count, 0)
+
+
+class TestHarvestStaleCacheTriggersRecapture(
+    unittest.IsolatedAsyncioTestCase
+):
+    """
+    R5-A3: When the cache is present but stale (TTL expired),
+    harvest_waa_token must treat it as a miss and re-run capture. The
+    stale templates are overwritten with the fresh capture.
+
+    This test will FAIL today for the same reason as A2: the harvester
+    doesn't touch the cache at all.
+    """
+
+    async def test_stale_cache_triggers_recapture(self):
+        import json as stdlib_json
+        import tempfile
+        import time
+
+        from gemini_webapi.utils import jspb_cache
+        from gemini_webapi.utils.waa_token import harvest_waa_token
+
+        with tempfile.TemporaryDirectory() as td:
+            cache_path = Path(td) / "jspb_templates.json"
+
+            cookies = Cookies()
+            cookies.set("__Secure-1PSID", "sid_x", domain=".google.com")
+
+            # Hand-craft a cache file with captured_at > 24h ago -- stale.
+            stale_templates = {
+                "flash": "[1,null,null,null,\"0000000000000000\",null,null,0,[4],null,null,3,null,null,1]",
+            }
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(
+                stdlib_json.dumps({
+                    "captured_at": time.time() - 48 * 3600,  # stale
+                    "source": "test_stale",
+                    "templates": stale_templates,
+                })
+            )
+            # Sanity: read_cache sees it as stale (returns None).
+            self.assertIsNone(jspb_cache.read_cache(path=cache_path))
+
+            mock_capture = AsyncMock(return_value=dict(_SAMPLE_TEMPLATES))
+
+            with _patch_playwright_for_harvest(), patch(
+                "gemini_webapi.utils.waa_token.capture_all_models",
+                mock_capture,
+            ):
+                await harvest_waa_token(cookies, cache_path=cache_path)
+
+            self.assertEqual(
+                mock_capture.await_count,
+                1,
+                "capture_all_models must run when cached templates are "
+                "stale.",
+            )
+
+            # The freshly captured templates overwrote the stale ones.
+            cached = jspb_cache.read_cache(path=cache_path)
+            self.assertIsNotNone(cached)
+            self.assertEqual(cached["templates"], _SAMPLE_TEMPLATES)
+            self.assertNotEqual(cached["templates"], stale_templates)
+
+
+class TestHarvestReturnsTemplatesInResultTuple(
+    unittest.IsolatedAsyncioTestCase
+):
+    """
+    R5-B: harvest_waa_token's return shape grows to a 7-tuple. The new
+    trailing element is the per-model templates dict (or None if capture
+    produced nothing).
+
+    This IS the breaking API change the client-side plumbing relies on:
+    _get_waa_token will destructure result[:7] and pass the trailing dict
+    to apply_autopatch.
+
+    This test will FAIL today because harvest_waa_token returns a 6-tuple.
+    """
+
+    async def test_returns_7_tuple_with_templates_dict(self):
+        import tempfile
+
+        from gemini_webapi.utils.waa_token import harvest_waa_token
+
+        with tempfile.TemporaryDirectory() as td:
+            cache_path = Path(td) / "jspb_templates.json"
+
+            cookies = Cookies()
+            cookies.set("__Secure-1PSID", "sid_x", domain=".google.com")
+
+            mock_capture = AsyncMock(return_value=dict(_SAMPLE_TEMPLATES))
+
+            with _patch_playwright_for_harvest(), patch(
+                "gemini_webapi.utils.waa_token.capture_all_models",
+                mock_capture,
+            ):
+                result = await harvest_waa_token(
+                    cookies, cache_path=cache_path
+                )
+
+            self.assertIsInstance(
+                result,
+                tuple,
+                f"harvest_waa_token must return a tuple; got "
+                f"{type(result).__name__}",
+            )
+            self.assertEqual(
+                len(result),
+                7,
+                f"harvest_waa_token must return a 7-tuple after R5; got "
+                f"{len(result)}-tuple. The trailing element is the per-"
+                f"model templates dict.",
+            )
+            per_model_templates = result[6]
+            self.assertIsInstance(
+                per_model_templates,
+                dict,
+                f"Position [6] of the harvester tuple must be the per-"
+                f"model templates dict; got "
+                f"{type(per_model_templates).__name__}",
+            )
+            # Must be the dict capture_all_models produced.
+            self.assertEqual(per_model_templates, _SAMPLE_TEMPLATES)
+
+
+# ---------------------------------------------------------------------------
+# R5-C: _generate invalidates jspb cache on PayloadValidationError
+# ---------------------------------------------------------------------------
+
+
+class TestGenerateInvalidatesCacheOnPayloadValidationError(
+    unittest.IsolatedAsyncioTestCase
+):
+    """
+    R5-C: When _generate detects the stream[5] drift fingerprint and is
+    about to raise PayloadValidationError, it must FIRST call
+    ``gemini_webapi.utils.jspb_cache.invalidate_cache``.  The debounce
+    inside invalidate_cache guarantees we do not purge the cache more
+    than once per hour, protecting against non-drift status-[5] errors
+    (quota, rate limit, etc.).
+
+    NOTE ON HARNESS: reaching the ``server_confirmed_failure`` branch in
+    ``_generate`` requires driving the full stream + read_chat recovery
+    loop (stream breaks after cid assignment; fetch_latest_chat_response
+    raises ServerError; all_stale flag false; server_confirmed_failure
+    true).  That is a substantial integration harness that the R5 slate
+    explicitly flags as pending.  This test is marked skip so the red-
+    phase contract is recorded without attempting the full harness; G5
+    will either extract a small raise-site helper (making this testable
+    directly) or build the integration harness alongside the
+    implementation.  Either way, R5's contract is pinned here: cache
+    invalidation MUST precede the raise.
+    """
+
+    @unittest.skip(
+        "harness pending G5 wiring: reaching the "
+        "server_confirmed_failure branch of _generate requires "
+        "driving the stream + read_chat recovery loop end-to-end. "
+        "G5 will either extract a small raise-site helper or add "
+        "the integration harness; either way cache-invalidation "
+        "before the raise is the contract this test pins."
+    )
+    async def test_invalidate_cache_called_before_payload_validation_raise(
+        self,
+    ):
+        """
+        Contract recorded for G5:
+
+        Given a GeminiClient whose _generate enters the
+        ``server_confirmed_failure`` branch, the following must hold:
+
+            1. ``gemini_webapi.utils.jspb_cache.invalidate_cache`` is
+               called exactly once.
+            2. PayloadValidationError is raised immediately after.
+            3. The invalidate_cache call happens BEFORE the raise
+               (i.e. if invalidate_cache raises, the test still
+               observes the call -- PayloadValidationError is not
+               raised first and then swallowed).
+
+        Minimal verification once the harness exists:
+
+            from gemini_webapi.utils import jspb_cache
+            with patch.object(jspb_cache, "invalidate_cache") as mock_inv:
+                with pytest.raises(PayloadValidationError):
+                    async for _ in client._generate(...):
+                        pass
+            mock_inv.assert_called_once()
+        """
+        from gemini_webapi.utils import jspb_cache  # noqa: F401  (pinned import)
+
+
+# ---------------------------------------------------------------------------
+# R7: CDP-first path resolution in harvest_waa_token (Phase 7)
+#
+# G1-G6 built the pieces (jspb_cache, apply_autopatch, capture_path probe,
+# template_capture, cache-aware harvester, diag capture helper) but
+# harvest_waa_token still unconditionally calls `chromium.launch(...)` --
+# i.e. it always takes the fresh-launch path. That is why Pro/Thinking
+# still capture as Flash in production (no full Chrome sign-in state in a
+# bare Playwright context).
+#
+# R7 pins the contract that harvest_waa_token MUST consult
+# `resolve_capture_path` first and, when the CDP probe succeeds, reuse the
+# already-running user Chrome via `chromium.connect_over_cdp(url)`. This
+# unlocks per-model capture for Pro/Thinking (they see the real Pro/Thinking
+# mode buttons because the user's Chrome is fully signed in), and it is a
+# prerequisite for G7's final integration.
+#
+# These tests MUST FAIL today because:
+#   - harvest_waa_token never imports or calls resolve_capture_path.
+#   - `chromium.connect_over_cdp` is never invoked.
+#   - The GEMINI_WAA_CHROME_URL env var is not read anywhere in the module.
+#
+# Fakes extended: _FakeChromium gains a `connect_over_cdp(url)` method; a
+# new _FakeCDPBrowser exposes `contexts` (a list with one pre-created
+# _FakeContext) and tracks whether close() was called. This mirrors the
+# real Playwright shape where `connect_over_cdp` returns a Browser whose
+# contexts[0] is the user's existing browsing context (not a new one).
+# ---------------------------------------------------------------------------
+
+
+import os
+
+
+class _FakeContext:
+    """Minimal Playwright BrowserContext with add_cookies + new_page."""
+
+    def __init__(self, page: "_FakePage"):
+        self._page = page
+        self.add_cookies = AsyncMock()
+
+    async def new_page(self):
+        return self._page
+
+
+class _FakeCDPBrowser:
+    """Stand-in for a browser returned by `chromium.connect_over_cdp(url)`.
+
+    Distinguishing feature vs _FakeBrowser: it exposes a pre-populated
+    `contexts` attribute (list) where contexts[0] is the user's existing
+    context -- harvest_waa_token must reuse it instead of calling
+    new_context(). Also tracks close() calls so the "CDP path does NOT
+    close the user's browser" contract is verifiable.
+    """
+
+    def __init__(self, page: "_FakePage"):
+        self.version = "146.0.7680.178"
+        self._context = _FakeContext(page)
+        self.contexts = [self._context]
+        self.close_called = False
+
+    async def new_context(self):
+        # If called on the CDP path, that's a bug -- we should reuse
+        # contexts[0] since it's the user's signed-in context.
+        raise AssertionError(
+            "new_context() must NOT be called on the CDP path; "
+            "harvest_waa_token should reuse contexts[0] from the "
+            "connected browser."
+        )
+
+    async def close(self):
+        self.close_called = True
+
+
+class _FakeChromiumCDP:
+    """Chromium factory supporting both launch() and connect_over_cdp().
+
+    Either `launch` or `connect_over_cdp` may be stubbed to raise
+    AssertionError so tests can pin "only the expected path is taken".
+    """
+
+    def __init__(
+        self,
+        page: "_FakePage",
+        *,
+        cdp_browser: _FakeCDPBrowser | None = None,
+        allow_launch: bool = True,
+        allow_cdp: bool = True,
+    ):
+        self._page = page
+        self._cdp_browser = cdp_browser
+        self._allow_launch = allow_launch
+        self._allow_cdp = allow_cdp
+        self.launch_calls: list[dict] = []
+        self.cdp_connect_calls: list[str] = []
+
+    async def launch(self, **kwargs):
+        self.launch_calls.append(kwargs)
+        if not self._allow_launch:
+            raise AssertionError(
+                "chromium.launch() was called but this test expected "
+                "the CDP path (connect_over_cdp). Path resolution is "
+                "broken: resolve_capture_path returned 'cdp' but the "
+                "harvester still fresh-launched Chrome."
+            )
+        return _FakeBrowser(self._page)
+
+    async def connect_over_cdp(self, url: str):
+        self.cdp_connect_calls.append(url)
+        if not self._allow_cdp:
+            raise AssertionError(
+                "chromium.connect_over_cdp() was called but this test "
+                "expected the fresh-launch path. Path resolution is "
+                "broken: resolve_capture_path returned 'fresh' but the "
+                "harvester still tried CDP."
+            )
+        if self._cdp_browser is None:
+            self._cdp_browser = _FakeCDPBrowser(self._page)
+        return self._cdp_browser
+
+
+class _FakePlaywrightCtxCDP:
+    def __init__(self, chromium: _FakeChromiumCDP):
+        self.chromium = chromium
+
+
+class _FakeAsyncPlaywrightCDP:
+    def __init__(self, chromium: _FakeChromiumCDP):
+        self._chromium = chromium
+
+    async def __aenter__(self):
+        return _FakePlaywrightCtxCDP(self._chromium)
+
+    async def __aexit__(self, *_a):
+        return False
+
+
+def _build_fake_playwright_cdp_factory(chromium: _FakeChromiumCDP):
+    """Factory that returns a patchable async_playwright() stand-in."""
+    def _factory():
+        return _FakeAsyncPlaywrightCDP(chromium)
+    return _factory
+
+
+def _make_cdp_harness():
+    """Build a fresh (page, chromium) pair wired to the StreamGenerate fake.
+
+    The chromium fake defaults to allowing both launch and connect_over_cdp
+    so individual tests can tighten the rules via the allow_* flags.
+    """
+    inner = _sample_reference_inner()
+    page = _FakePage(
+        token="!sample_waa_token_xxxxxxxxxxxxxxxxxxxx",
+        botguard_hash="deadbeefdeadbeef" * 2,
+        reference_inner=inner,
+    )
+    cdp_browser = _FakeCDPBrowser(page)
+    chromium = _FakeChromiumCDP(page, cdp_browser=cdp_browser)
+    return page, chromium, cdp_browser
+
+
+class TestHarvestUsesCDPWhenProbeSucceeds(unittest.IsolatedAsyncioTestCase):
+    """
+    R7-A1: When resolve_capture_path returns ("cdp", url), harvest_waa_token
+    MUST reuse the user's running Chrome via `chromium.connect_over_cdp(url)`
+    instead of fresh-launching.  This is the only way Pro/Thinking capture
+    correctly -- a bare Playwright context is not signed in to the user's
+    Google account, so those mode buttons render as aria-disabled and the
+    template capture falls through to Flash.
+
+    This test will FAIL today because harvest_waa_token unconditionally
+    calls `p.chromium.launch(channel="chrome", ...)` -- it never inspects
+    the resolve_capture_path result, never calls connect_over_cdp, and
+    never reuses contexts[0].
+    """
+
+    async def test_harvest_uses_connect_over_cdp_on_cdp_path(self):
+        import tempfile
+
+        from gemini_webapi.utils.waa_token import harvest_waa_token
+
+        with tempfile.TemporaryDirectory() as td:
+            cache_path = Path(td) / "jspb_templates.json"
+
+            cookies = Cookies()
+            cookies.set("__Secure-1PSID", "sid_x", domain=".google.com")
+
+            page, chromium, cdp_browser = _make_cdp_harness()
+            # Pin expectation: CDP path only; launch() must NOT be called.
+            chromium._allow_launch = False
+
+            mock_capture = AsyncMock(return_value=dict(_SAMPLE_TEMPLATES))
+
+            with patch(
+                "playwright.async_api.async_playwright",
+                _build_fake_playwright_cdp_factory(chromium),
+            ), patch(
+                "gemini_webapi.utils.waa_token.resolve_capture_path",
+                return_value=("cdp", "http://localhost:9222"),
+            ), patch(
+                "gemini_webapi.utils.waa_token.capture_all_models",
+                mock_capture,
+            ):
+                result = await harvest_waa_token(
+                    cookies, cache_path=cache_path
+                )
+
+            # connect_over_cdp was called exactly once at the resolved URL.
+            self.assertEqual(
+                chromium.cdp_connect_calls,
+                ["http://localhost:9222"],
+                "harvest_waa_token must call chromium.connect_over_cdp() "
+                "with the URL returned by resolve_capture_path.",
+            )
+            # launch() was NOT called -- the CDP path is exclusive.
+            self.assertEqual(
+                chromium.launch_calls,
+                [],
+                "chromium.launch() must NOT be called when the CDP path "
+                "is selected. The harvester is still fresh-launching "
+                "instead of reusing the user's Chrome.",
+            )
+            # Per-model capture still ran (the whole point of CDP is that
+            # Pro/Thinking capture correctly now that we have sign-in state).
+            self.assertEqual(mock_capture.await_count, 1)
+            # Harvest returned normally with the 7-tuple shape.
+            self.assertIsInstance(result, tuple)
+            self.assertEqual(len(result), 7)
+
+
+class TestHarvestFallsBackToFreshLaunchWhenCDPUnavailable(
+    unittest.IsolatedAsyncioTestCase
+):
+    """
+    R7-A2: When resolve_capture_path returns ("fresh", None) -- no Chrome
+    on the debug port and no managed profile -- harvest_waa_token must
+    fresh-launch via `chromium.launch(channel="chrome", ...)` as before.
+    This preserves current behaviour for users without a debug-port Chrome.
+
+    This test will FAIL today because harvest_waa_token doesn't call
+    resolve_capture_path at all -- it can't conditionally choose a path.
+    """
+
+    async def test_fresh_launch_when_resolve_returns_fresh(self):
+        import tempfile
+
+        from gemini_webapi.utils.waa_token import harvest_waa_token
+
+        with tempfile.TemporaryDirectory() as td:
+            cache_path = Path(td) / "jspb_templates.json"
+
+            cookies = Cookies()
+            cookies.set("__Secure-1PSID", "sid_x", domain=".google.com")
+
+            page, chromium, _ = _make_cdp_harness()
+            # Pin expectation: fresh path only; connect_over_cdp must NOT fire.
+            chromium._allow_cdp = False
+
+            mock_capture = AsyncMock(return_value=dict(_SAMPLE_TEMPLATES))
+
+            with patch(
+                "playwright.async_api.async_playwright",
+                _build_fake_playwright_cdp_factory(chromium),
+            ), patch(
+                "gemini_webapi.utils.waa_token.resolve_capture_path",
+                return_value=("fresh", None),
+            ), patch(
+                "gemini_webapi.utils.waa_token.capture_all_models",
+                mock_capture,
+            ):
+                result = await harvest_waa_token(
+                    cookies, cache_path=cache_path
+                )
+
+            # launch() was called (fresh path preserved).
+            self.assertEqual(
+                len(chromium.launch_calls),
+                1,
+                "chromium.launch() must be called exactly once on the "
+                "fresh-launch path.",
+            )
+            # Verify it was launched with channel="chrome" (current behaviour).
+            launch_kwargs = chromium.launch_calls[0]
+            self.assertEqual(
+                launch_kwargs.get("channel"),
+                "chrome",
+                "Fresh-launch path must pass channel='chrome' to keep "
+                "using the system Chrome install.",
+            )
+            # connect_over_cdp was NOT called.
+            self.assertEqual(
+                chromium.cdp_connect_calls,
+                [],
+                "chromium.connect_over_cdp() must NOT be called when "
+                "resolve_capture_path returned 'fresh'.",
+            )
+            self.assertIsInstance(result, tuple)
+            self.assertEqual(len(result), 7)
+
+
+class TestHarvestReadsChromeUrlFromEnvVar(unittest.IsolatedAsyncioTestCase):
+    """
+    R7-A3: `GEMINI_WAA_CHROME_URL` lets users override the default CDP probe
+    URL (http://localhost:9222). harvest_waa_token must read the env var and
+    pass it to resolve_capture_path as `cdp_url_override`. Without this
+    plumbing, users running Chrome on a non-default debug port cannot
+    benefit from the CDP path at all.
+
+    This test will FAIL today because the env var name does not appear
+    anywhere in waa_token.py.
+    """
+
+    async def test_env_var_flows_through_to_resolve_capture_path(self):
+        import tempfile
+
+        from gemini_webapi.utils.waa_token import harvest_waa_token
+
+        with tempfile.TemporaryDirectory() as td:
+            cache_path = Path(td) / "jspb_templates.json"
+
+            cookies = Cookies()
+            cookies.set("__Secure-1PSID", "sid_x", domain=".google.com")
+
+            page, chromium, _ = _make_cdp_harness()
+            chromium._allow_launch = False  # CDP path only
+
+            mock_capture = AsyncMock(return_value=dict(_SAMPLE_TEMPLATES))
+            mock_resolve = MagicMock(
+                return_value=("cdp", "http://localhost:9999")
+            )
+
+            # Set the env var to a non-default URL. The harvester must
+            # pick this up and forward it as cdp_url_override.
+            with patch.dict(
+                os.environ,
+                {"GEMINI_WAA_CHROME_URL": "http://localhost:9999"},
+                clear=False,
+            ), patch(
+                "playwright.async_api.async_playwright",
+                _build_fake_playwright_cdp_factory(chromium),
+            ), patch(
+                "gemini_webapi.utils.waa_token.resolve_capture_path",
+                mock_resolve,
+            ), patch(
+                "gemini_webapi.utils.waa_token.capture_all_models",
+                mock_capture,
+            ):
+                await harvest_waa_token(cookies, cache_path=cache_path)
+
+            # resolve_capture_path was called with cdp_url_override set to
+            # the env var value.
+            self.assertEqual(
+                mock_resolve.call_count,
+                1,
+                "resolve_capture_path must be called exactly once per "
+                "harvest.",
+            )
+            _, kwargs = mock_resolve.call_args
+            self.assertEqual(
+                kwargs.get("cdp_url_override"),
+                "http://localhost:9999",
+                "GEMINI_WAA_CHROME_URL must be forwarded to "
+                "resolve_capture_path as cdp_url_override. Got kwargs: "
+                f"{kwargs!r}",
+            )
+            # The returned URL drives connect_over_cdp.
+            self.assertEqual(
+                chromium.cdp_connect_calls,
+                ["http://localhost:9999"],
+                "connect_over_cdp must be invoked with the URL resolved "
+                "from the env-var override.",
+            )
+
+
+class TestHarvestDoesNotCloseUserOwnedCDPBrowser(
+    unittest.IsolatedAsyncioTestCase
+):
+    """
+    R7-A4: On the CDP path, the browser belongs to the user (it was
+    already running before harvest_waa_token connected). Calling
+    `browser.close()` on it would terminate the user's Chrome -- a
+    catastrophic side effect. The harvester MUST skip close() when it
+    did not launch the browser.
+
+    On the fresh-launch path, the harvester owns the browser and MUST
+    close it at teardown (confirmed by existing R5 tests).
+
+    This test will FAIL today because harvest_waa_token always calls
+    `browser.close()` in its finally block regardless of path.
+    """
+
+    async def test_cdp_browser_not_closed_at_teardown(self):
+        import tempfile
+
+        from gemini_webapi.utils.waa_token import harvest_waa_token
+
+        with tempfile.TemporaryDirectory() as td:
+            cache_path = Path(td) / "jspb_templates.json"
+
+            cookies = Cookies()
+            cookies.set("__Secure-1PSID", "sid_x", domain=".google.com")
+
+            page, chromium, cdp_browser = _make_cdp_harness()
+            chromium._allow_launch = False  # CDP path only
+
+            mock_capture = AsyncMock(return_value=dict(_SAMPLE_TEMPLATES))
+
+            with patch(
+                "playwright.async_api.async_playwright",
+                _build_fake_playwright_cdp_factory(chromium),
+            ), patch(
+                "gemini_webapi.utils.waa_token.resolve_capture_path",
+                return_value=("cdp", "http://localhost:9222"),
+            ), patch(
+                "gemini_webapi.utils.waa_token.capture_all_models",
+                mock_capture,
+            ):
+                await harvest_waa_token(cookies, cache_path=cache_path)
+
+            self.assertFalse(
+                cdp_browser.close_called,
+                "CDP-connected browser must NOT be closed by the "
+                "harvester -- it belongs to the user. Calling close() "
+                "on it would terminate the user's entire Chrome session.",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

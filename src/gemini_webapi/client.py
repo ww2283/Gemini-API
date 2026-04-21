@@ -251,7 +251,33 @@ class GeminiClient(ChatMixin, GemMixin):
 
                 result = await harvest_waa_token(self.cookies)
                 if isinstance(result, tuple):
-                    if len(result) >= 6:
+                    if len(result) >= 7:
+                        (
+                            token,
+                            browser_version,
+                            model_ids,
+                            botguard_hash,
+                            reference_inner,
+                            reference_headers,
+                            per_model_templates,
+                        ) = result[:7]
+                        if model_ids:
+                            self._discovered_model_ids = model_ids
+                        if reference_inner is not None:
+                            cache_key = target_model_type or "flash"
+                            try:
+                                self._reference_inner_req_lists[cache_key] = reference_inner
+                            except AttributeError:
+                                self._reference_inner_req_lists = {cache_key: reference_inner}
+                        if isinstance(per_model_templates, dict) and per_model_templates:
+                            try:
+                                from .utils.jspb_patch import apply_autopatch
+                                apply_autopatch(per_model_templates)
+                            except Exception as patch_err:
+                                logger.debug(
+                                    f"jspb autopatch skipped: {patch_err}"
+                                )
+                    elif len(result) == 6:
                         (
                             token,
                             browser_version,
@@ -268,14 +294,6 @@ class GeminiClient(ChatMixin, GemMixin):
                                 self._reference_inner_req_lists[cache_key] = reference_inner
                             except AttributeError:
                                 self._reference_inner_req_lists = {cache_key: reference_inner}
-                        if isinstance(reference_headers, dict) and reference_headers:
-                            try:
-                                from .utils.jspb_patch import apply_autopatch
-                                apply_autopatch(reference_headers)
-                            except Exception as patch_err:
-                                logger.debug(
-                                    f"jspb autopatch skipped: {patch_err}"
-                                )
                     elif len(result) == 5:
                         token, browser_version, model_ids, botguard_hash, reference_inner = result
                         if model_ids:
@@ -1203,6 +1221,17 @@ class GeminiClient(ChatMixin, GemMixin):
                             else str(raw_model_name)
                         )
                         diag_alias = self._MODEL_TYPE_MAP.get(model_name_str, "pro")
+                        # Drop the cached per-model jspb templates so the next
+                        # harvest recaptures from live Chrome. The 1h debounce
+                        # inside invalidate_cache protects against churn when
+                        # status [5] is not actually caused by drift.
+                        try:
+                            from .utils import jspb_cache
+                            jspb_cache.invalidate_cache()
+                        except Exception as inv_err:
+                            logger.debug(
+                                f"jspb_cache.invalidate_cache failed: {inv_err}"
+                            )
                         raise PayloadValidationError(
                             f"Stream failed for cid={chat.cid!r} on model "
                             f"{model_name_str!r}; server confirmed generation "

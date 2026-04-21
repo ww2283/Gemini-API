@@ -47,9 +47,12 @@ from urllib.request import urlopen
 
 from .client import build_diagnostic_inner_req_list, _DIFF_EXCLUDED_SLOTS
 from .constants import Model
+from .utils.template_capture import (
+    _TRACKED_HEADERS,
+    capture_model_template,
+)
 from .utils.waa_token import (
     harvest_waa_token,
-    _parse_stream_generate_request,
     _find_system_chrome,
 )
 
@@ -125,22 +128,16 @@ def _launch_managed_chrome(headless: bool) -> subprocess.Popen | None:
     return None
 
 
-_TRACKED_HEADERS: tuple[str, ...] = (
-    "x-goog-ext-525001261-jspb",
-    "x-goog-ext-73010989-jspb",
-    "x-goog-ext-73010990-jspb",
-)
-
-
 async def _capture_via_cdp(
     cdp_url: str, target_model: str
 ) -> dict[str, Any] | None:
     """Connect to a Chrome at cdp_url and capture a StreamGenerate request
     for target_model.
 
-    Returns ``{"inner": list, "headers": {header_name: value}}`` on success
-    or ``None`` on failure. ``headers`` only includes values that were
-    present on the captured request; missing entries are omitted.
+    Returns ``{"inner": list, "headers": {header_name: value},
+    "raw_jspb": str}`` on success or ``None`` on failure. ``headers`` only
+    includes values that were present on the captured request; missing
+    entries are omitted.
     """
     try:
         from playwright.async_api import async_playwright
@@ -148,33 +145,6 @@ async def _capture_via_cdp(
         print("diag: playwright not installed", file=sys.stderr)
         return None
 
-    captured: dict[str, Any] = {"inner": None, "headers": {}}
-    captured_event = asyncio.Event()
-
-    async def handle_route(route):
-        try:
-            post_data = route.request.post_data
-            if post_data:
-                parsed = _parse_stream_generate_request(post_data)
-                if (
-                    parsed
-                    and isinstance(parsed["token"], str)
-                    and parsed["token"].startswith("!")
-                ):
-                    captured["inner"] = parsed["reference_inner"]
-                    req_headers = route.request.headers or {}
-                    for hname in _TRACKED_HEADERS:
-                        value = req_headers.get(hname) or req_headers.get(
-                            hname.lower()
-                        )
-                        if value is not None:
-                            captured["headers"][hname] = value
-                    captured_event.set()
-        except Exception:
-            pass
-        await route.abort()
-
-    label = _MODE_PICKER_LABEL.get(target_model, "Pro")
     try:
         async with async_playwright() as p:
             browser = await p.chromium.connect_over_cdp(cdp_url)
@@ -184,7 +154,6 @@ async def _capture_via_cdp(
             ctx = browser.contexts[0]
             page = await ctx.new_page()
             try:
-                await page.route("**/StreamGenerate*", handle_route)
                 await page.goto(
                     "https://gemini.google.com/app",
                     wait_until="domcontentloaded",
@@ -209,40 +178,7 @@ async def _capture_via_cdp(
                 except Exception:
                     pass
 
-                current_label = await page.evaluate(
-                    "() => { const b = document.querySelector('button[aria-label=\"Open mode picker\"]'); return b ? b.textContent.trim() : ''; }"
-                )
-                if current_label != label:
-                    try:
-                        await page.click(
-                            'button[aria-label="Open mode picker"]', timeout=3000
-                        )
-                        await page.wait_for_selector(
-                            f'[data-test-id="bard-mode-option-{target_model}"]',
-                            timeout=3000,
-                        )
-                        await page.click(
-                            f'[data-test-id="bard-mode-option-{target_model}"]',
-                            timeout=3000,
-                        )
-                        await asyncio.sleep(0.5)
-                    except Exception as e:
-                        print(
-                            f"diag: could not select mode {target_model!r}: {e}",
-                            file=sys.stderr,
-                        )
-                        return None
-
-                input_sel = 'div[contenteditable="true"], textarea'
-                await page.click(input_sel, force=True)
-                await page.type(input_sel, "hi")
-                await page.click(
-                    'button[aria-label*="Send"]', force=True, timeout=5000
-                )
-                try:
-                    await asyncio.wait_for(captured_event.wait(), timeout=15)
-                except asyncio.TimeoutError:
-                    pass
+                return await capture_model_template(page, target_model)
             finally:
                 try:
                     await page.close()
@@ -251,10 +187,6 @@ async def _capture_via_cdp(
     except Exception as e:
         print(f"diag: CDP connection failed: {e}", file=sys.stderr)
         return None
-
-    if captured["inner"] is None:
-        return None
-    return captured
 
 
 def _load_cookies(path: Path) -> Any:
