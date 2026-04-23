@@ -15,7 +15,7 @@ These tests MUST FAIL because _generate() does not yet call _get_waa_token().
 
 import asyncio
 import unittest
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1706,8 +1706,9 @@ _SAMPLE_TEMPLATES: dict[str, str] = {
 }
 
 
+@contextmanager
 def _patch_playwright_for_harvest():
-    """Return a patcher for ``playwright.async_api.async_playwright``.
+    """Patch playwright AND pin the capture-path resolver to fresh-launch.
 
     Callers use::
 
@@ -1715,7 +1716,10 @@ def _patch_playwright_for_harvest():
             ...
 
     The yielded ``page`` is the same _FakePage the harvester will drive,
-    in case the test wants to pre-seed its state.
+    in case the test wants to pre-seed its state. The resolver pin makes
+    these tests environment-independent — without it, a machine that has
+    run ``diag --setup`` would route through the managed-profile branch
+    instead of fresh-launch.
     """
     inner = _sample_reference_inner()
     page = _FakePage(
@@ -1724,7 +1728,13 @@ def _patch_playwright_for_harvest():
         reference_inner=inner,
     )
     factory = _build_fake_playwright_factory(page)
-    return patch("playwright.async_api.async_playwright", factory)
+    with patch(
+        "playwright.async_api.async_playwright", factory
+    ), patch(
+        "gemini_webapi.utils.waa_token.resolve_capture_path",
+        return_value=("fresh", None),
+    ):
+        yield page
 
 
 class TestHarvestWritesTemplatesToCacheOnFullCapture(
@@ -2760,6 +2770,489 @@ class TestHarvestDoesNotWarnWhenCacheComplete(
             "fresh launch captured all three templates. The warning is "
             "strictly for the incomplete-capture condition.",
         )
+
+
+# ---------------------------------------------------------------------------
+# R1 (runtime-managed-profile-wiring): managed profile path wired into the
+# runtime harvester.
+#
+# Bug: `harvest_waa_token` passes `managed_profile_path=None` to
+# `resolve_capture_path`, and the harvester body has only two branches:
+# `source == "cdp"` and an implicit `else` that fresh-launches. The managed
+# profile created by `python -m gemini_webapi.diag --setup` is therefore
+# never consulted at runtime, leaving naive users on fresh-launch and
+# Pro/Thinking silently failing on stream [5].
+#
+# R1 pins the managed-profile runtime contract:
+#   T1: source=="managed" takes the connect_over_cdp branch (NOT launch).
+#   T2: the managed profile dir is forwarded to resolve_capture_path as a
+#       non-None Path via the managed_profile_path kwarg.
+#   T3: on successful managed-path capture, jspb_cache.write_cache records
+#       source="managed" (not the hardcoded "fresh" at waa_token.py:388).
+#   T4: the fresh-launch/Pro-missing warning is gated strictly on source
+#       =="fresh" and does NOT fire when source=="managed" (even if the
+#       managed capture returned flash-only templates for some edge reason).
+#
+# Patching strategy (rationale):
+#   - resolve_capture_path is patched to return ("managed", "/fake/profile")
+#     — same target the CDP/fresh R7 tests use. This sidesteps the real
+#     profile validity check entirely.
+#   - subprocess.Popen and time.sleep are patched to stop any managed-Chrome
+#     spawn from escaping to the real OS and to keep the tests fast. The
+#     exact G1 helper name is NOT pinned; the tests only care about
+#     observable outcomes (connect_over_cdp fired; launch did not; cache
+#     source; warning absence).
+#   - probe_cdp_url is patched at the capture_path source so whatever
+#     readiness check the managed branch uses reports ready immediately.
+#   - The existing _FakeChromiumCDP with `allow_launch=False` is the
+#     sentinel that proves the managed branch took connect_over_cdp and
+#     NOT the fresh-launch codepath.
+#
+# These tests MUST FAIL today because:
+#   - waa_token.py:256 hardcodes `managed_profile_path=None`, so
+#     resolve_capture_path is never asked about the managed profile (T2).
+#   - there is no `source == "managed"` branch in the harvester body, so
+#     the implicit `else` falls through to `chromium.launch()` —
+#     _FakeChromiumCDP with allow_launch=False trips AssertionError (T1).
+#   - waa_token.py:388 hardcodes `source="fresh"` in write_cache (T3).
+#   - the fresh-launch warning is gated on `source == "fresh"` but since
+#     source can never be "managed" today the gate is never exercised (T4).
+# ---------------------------------------------------------------------------
+
+
+import subprocess as _subprocess_for_patch  # noqa: E402
+import time as _time_for_patch  # noqa: E402
+
+
+def _managed_path_patch_stack(
+    chromium: "_FakeChromiumCDP",
+    resolve_mock: "MagicMock | None" = None,
+    capture_mock: "AsyncMock | None" = None,
+    write_cache_spy: "MagicMock | None" = None,
+    managed_profile_str: str = "/fake/managed/profile",
+):
+    """Context-manager-like helper that installs all patches the managed
+    path exercises: async_playwright, resolve_capture_path, capture_all_models,
+    subprocess.Popen (to neutralize any real Chrome spawn), time.sleep (to
+    keep the test fast if the implementer uses a readiness poll loop),
+    probe_cdp_url (so whatever CDP-ready probe the managed branch uses
+    reports ready immediately), and optionally jspb_cache.write_cache.
+
+    Returns a list of active ``patch`` context managers; caller uses
+    contextlib.ExitStack.
+    """
+    from contextlib import ExitStack
+
+    stack = ExitStack()
+
+    # Core patches for the managed path contract.
+    stack.enter_context(patch(
+        "playwright.async_api.async_playwright",
+        _build_fake_playwright_cdp_factory(chromium),
+    ))
+    stack.enter_context(patch(
+        "gemini_webapi.utils.waa_token.resolve_capture_path",
+        resolve_mock if resolve_mock is not None
+        else MagicMock(return_value=("managed", managed_profile_str)),
+    ))
+    stack.enter_context(patch(
+        "gemini_webapi.utils.waa_token.capture_all_models",
+        capture_mock if capture_mock is not None
+        else AsyncMock(return_value=dict(_SAMPLE_TEMPLATES)),
+    ))
+
+    # Neutralize any real subprocess/time/probe calls the managed-Chrome
+    # launcher may issue. The tests do NOT pin HOW the managed Chrome is
+    # started -- G1 can pick the shape -- but they DO pin that nothing
+    # escapes to the real OS during the test.
+    stack.enter_context(patch.object(_subprocess_for_patch, "Popen", MagicMock()))
+    stack.enter_context(patch.object(_time_for_patch, "sleep", MagicMock()))
+    stack.enter_context(patch(
+        "gemini_webapi.utils.capture_path.probe_cdp_url",
+        return_value=True,
+    ))
+
+    if write_cache_spy is not None:
+        stack.enter_context(patch(
+            "gemini_webapi.utils.waa_token.jspb_cache.write_cache",
+            write_cache_spy,
+        ))
+
+    return stack
+
+
+class TestHarvestUsesCDPWhenManagedProfileResolved(
+    unittest.IsolatedAsyncioTestCase
+):
+    """
+    R1-T1 (managed-profile-wiring): When resolve_capture_path returns
+    ("managed", "<profile_dir>"), harvest_waa_token MUST reach the browser
+    via ``chromium.connect_over_cdp(<url>)`` -- the same mechanism the CDP
+    path uses -- and MUST NOT fresh-launch via ``chromium.launch()``.
+
+    The whole reason the managed profile exists is that a bare Playwright
+    context cannot render the Pro/Thinking mode buttons (they come back
+    aria-disabled without a real account sign-in). Spawning a Chrome that
+    points at the managed profile + CDP-connecting to it is the only way
+    to inherit the user's sign-in state at runtime. If the harvester
+    falls through to ``chromium.launch()`` here, the managed profile is
+    effectively a no-op at runtime.
+
+    This test MUST FAIL today because waa_token.py:256 hardcodes
+    ``managed_profile_path=None`` and the harvester has no
+    ``source == "managed"`` branch, so the implicit ``else`` falls through
+    to ``chromium.launch()``. The ``_FakeChromiumCDP(allow_launch=False)``
+    sentinel triggers an AssertionError inside the harvester, which the
+    harvester wraps into WAATokenError -- that wrapping is the visible
+    failure today.
+    """
+
+    async def test_managed_source_takes_connect_over_cdp_branch(self):
+        import tempfile
+
+        from gemini_webapi.utils.waa_token import harvest_waa_token
+
+        with tempfile.TemporaryDirectory() as td:
+            cache_path = Path(td) / "jspb_templates.json"
+            fake_profile = Path(td) / "managed_profile"
+            fake_profile.mkdir()
+
+            cookies = Cookies()
+            cookies.set("__Secure-1PSID", "sid_x", domain=".google.com")
+
+            page, chromium, cdp_browser = _make_cdp_harness()
+            # Pin expectation: the managed branch MUST reach connect_over_cdp.
+            # If it falls through to launch(), the fake raises AssertionError
+            # which bubbles out as WAATokenError wrapping.
+            chromium._allow_launch = False
+
+            mock_capture = AsyncMock(return_value=dict(_SAMPLE_TEMPLATES))
+            resolve_mock = MagicMock(
+                return_value=("managed", str(fake_profile))
+            )
+
+            with _managed_path_patch_stack(
+                chromium,
+                resolve_mock=resolve_mock,
+                capture_mock=mock_capture,
+            ):
+                result = await harvest_waa_token(
+                    cookies, cache_path=cache_path
+                )
+
+            # connect_over_cdp was called exactly once on the managed path.
+            # Exact URL is NOT pinned -- G1 picks the port -- but the call
+            # must have happened.
+            self.assertEqual(
+                len(chromium.cdp_connect_calls),
+                1,
+                "harvest_waa_token must call chromium.connect_over_cdp() "
+                "exactly once on the managed path. Actual cdp_connect_calls: "
+                f"{chromium.cdp_connect_calls!r}; launch_calls: "
+                f"{chromium.launch_calls!r}. If launch_calls is non-empty "
+                "the managed branch fell through to fresh-launch -- the "
+                "exact bug this test is pinning.",
+            )
+            # launch() was NOT called -- the managed path is exclusive of
+            # fresh-launch. If this fails it means the managed-source branch
+            # doesn't exist yet and the implicit `else` swallowed the path.
+            self.assertEqual(
+                chromium.launch_calls,
+                [],
+                "chromium.launch() must NOT be called when resolve_capture"
+                "_path returned 'managed'. The managed profile unlocks "
+                "Pro/Thinking capture only if we reuse it via CDP; "
+                "fresh-launch defeats the purpose.",
+            )
+            # Per-model capture still ran.
+            self.assertEqual(mock_capture.await_count, 1)
+            # Harvest returned normally with the 7-tuple shape.
+            self.assertIsInstance(result, tuple)
+            self.assertEqual(len(result), 7)
+
+
+class TestHarvestForwardsManagedProfilePathToResolver(
+    unittest.IsolatedAsyncioTestCase
+):
+    """
+    R1-T2 (managed-profile-wiring): harvest_waa_token must call
+    resolve_capture_path with ``managed_profile_path`` set to a non-None
+    ``Path`` pointing at the managed profile directory. Today
+    waa_token.py:256 hardcodes ``managed_profile_path=None``, so the
+    resolver never even considers the managed branch — it can only ever
+    return ("cdp", ...) or ("fresh", None).
+
+    Contract pinned here:
+      - resolve_capture_path is called exactly once per harvest.
+      - The ``managed_profile_path`` kwarg is present and is NOT None.
+      - The value is a ``pathlib.Path`` (not a bare string). The resolver
+        does ``.exists()`` and ``/ "Default"`` on the argument, so a Path
+        is the correct type.
+
+    The exact path value is not pinned here (G1 picks the constant —
+    presumably imported from diag or a shared module). The test only
+    asserts non-None-Path.
+
+    This test MUST FAIL today because waa_token.py:256 unconditionally
+    passes ``managed_profile_path=None``.
+    """
+
+    async def test_managed_profile_path_forwarded_to_resolver(self):
+        import tempfile
+
+        from gemini_webapi.utils.waa_token import harvest_waa_token
+
+        with tempfile.TemporaryDirectory() as td:
+            cache_path = Path(td) / "jspb_templates.json"
+            fake_profile = Path(td) / "managed_profile"
+            fake_profile.mkdir()
+
+            cookies = Cookies()
+            cookies.set("__Secure-1PSID", "sid_x", domain=".google.com")
+
+            page, chromium, _ = _make_cdp_harness()
+            # T2 focuses narrowly on the resolver call shape. Allow both
+            # branches so the harvester can complete (even via fallthrough)
+            # -- the only assertion that matters here is that the resolver
+            # was called with a non-None managed_profile_path.
+
+            mock_capture = AsyncMock(return_value=dict(_SAMPLE_TEMPLATES))
+            resolve_mock = MagicMock(
+                return_value=("managed", str(fake_profile))
+            )
+
+            # Tolerate the harvester crashing (missing managed branch) --
+            # T2 only asserts against the resolver call, which happens
+            # BEFORE any branch decision.
+            with _managed_path_patch_stack(
+                chromium,
+                resolve_mock=resolve_mock,
+                capture_mock=mock_capture,
+            ):
+                try:
+                    await harvest_waa_token(
+                        cookies, cache_path=cache_path
+                    )
+                except Exception:
+                    pass
+
+            # Resolver consulted exactly once.
+            self.assertEqual(
+                resolve_mock.call_count,
+                1,
+                "resolve_capture_path must be called exactly once per "
+                "harvest.",
+            )
+            _, kwargs = resolve_mock.call_args
+            # managed_profile_path kwarg must be present AND non-None.
+            self.assertIn(
+                "managed_profile_path",
+                kwargs,
+                "harvest_waa_token must pass managed_profile_path as a "
+                "keyword argument to resolve_capture_path. Without this "
+                "kwarg the resolver cannot consider the managed branch. "
+                f"Actual kwargs: {kwargs!r}",
+            )
+            managed_arg = kwargs["managed_profile_path"]
+            self.assertIsNotNone(
+                managed_arg,
+                "managed_profile_path MUST be non-None. Today "
+                "waa_token.py:256 hardcodes None, making the managed "
+                "profile unreachable from the runtime harvester. That is "
+                "exactly the bug this test pins.",
+            )
+            self.assertIsInstance(
+                managed_arg,
+                Path,
+                "managed_profile_path must be a pathlib.Path (the "
+                "resolver calls .exists() and uses path division on it). "
+                f"Got {type(managed_arg).__name__}: {managed_arg!r}",
+            )
+
+
+class TestHarvestWritesCacheWithManagedSource(
+    unittest.IsolatedAsyncioTestCase
+):
+    """
+    R1-T3 (managed-profile-wiring): When the managed path produces a
+    successful per-model capture, the subsequent ``jspb_cache.write_cache``
+    call MUST record ``source="managed"`` — NOT the hardcoded "fresh"
+    sidecar bug at waa_token.py:388.
+
+    Why it matters: the cache's ``source`` field is the provenance
+    audit trail. A cache entry that says ``source="fresh"`` when it was
+    actually captured via the managed profile undermines future
+    invalidation logic (e.g. "refetch if source changed", "dashboard says
+    X% of fleet on managed path"), and it misleads anyone reading the
+    cache file during drift investigation.
+
+    This test MUST FAIL today because waa_token.py:388 unconditionally
+    passes ``source="fresh"`` to write_cache, regardless of the actual
+    resolved source.
+    """
+
+    async def test_write_cache_source_is_managed_on_managed_path(self):
+        import tempfile
+
+        from gemini_webapi.utils.waa_token import harvest_waa_token
+
+        with tempfile.TemporaryDirectory() as td:
+            cache_path = Path(td) / "jspb_templates.json"
+            fake_profile = Path(td) / "managed_profile"
+            fake_profile.mkdir()
+
+            cookies = Cookies()
+            cookies.set("__Secure-1PSID", "sid_x", domain=".google.com")
+
+            page, chromium, _ = _make_cdp_harness()
+            # T3 asserts on the write_cache call shape after a successful
+            # managed-path capture. If the managed branch is missing, the
+            # harvester crashes before write_cache -- that's still a correct
+            # red-phase failure (call_count==0 instead of source=='managed').
+
+            mock_capture = AsyncMock(return_value=dict(_SAMPLE_TEMPLATES))
+            resolve_mock = MagicMock(
+                return_value=("managed", str(fake_profile))
+            )
+            # Spy that records every call to write_cache. We assert against
+            # call_args below. Note: write_cache is synchronous -- MagicMock.
+            write_cache_spy = MagicMock()
+
+            with _managed_path_patch_stack(
+                chromium,
+                resolve_mock=resolve_mock,
+                capture_mock=mock_capture,
+                write_cache_spy=write_cache_spy,
+            ):
+                try:
+                    await harvest_waa_token(
+                        cookies, cache_path=cache_path
+                    )
+                except Exception:
+                    # Harvester may crash today because the managed branch
+                    # is missing -- the assertion below still pins the
+                    # contract (call_count must be 1 AND source must be
+                    # "managed").
+                    pass
+
+            # write_cache must have been called exactly once.
+            self.assertEqual(
+                write_cache_spy.call_count,
+                1,
+                "jspb_cache.write_cache must be called exactly once on "
+                "cache-miss capture via the managed path. Today the "
+                "harvester has no 'managed' branch so the capture never "
+                "reaches write_cache. Actual call_count: "
+                f"{write_cache_spy.call_count}",
+            )
+            args, kwargs = write_cache_spy.call_args
+            # The source may be passed positionally (templates, source, ...)
+            # or as a keyword. Support both, but prefer keyword.
+            source_value = kwargs.get("source")
+            if source_value is None and len(args) >= 2:
+                source_value = args[1]
+            self.assertEqual(
+                source_value,
+                "managed",
+                "jspb_cache.write_cache must record source='managed' "
+                "when the managed profile produced the capture. Today "
+                "waa_token.py:388 hardcodes source='fresh', corrupting "
+                f"the provenance audit trail. Actual source: "
+                f"{source_value!r}; full call_args: args={args!r}, "
+                f"kwargs={kwargs!r}",
+            )
+
+
+class TestHarvestSuppressesFreshWarningOnManagedSource(
+    unittest.IsolatedAsyncioTestCase
+):
+    """
+    R1-T4 (managed-profile-wiring): The fresh-launch/Pro-missing warning
+    at waa_token.py:399-413 is gated on ``source == "fresh"``. That gate
+    MUST continue to hold: even if the managed path returns an incomplete
+    templates dict (e.g. ``{"flash": "..."}`` only) for some edge reason,
+    the warning MUST NOT fire because:
+
+      - The warning's actionable remediation is "run ``diag --setup`` or
+        start Chrome on port 9222". If the user is ALREADY on the managed
+        path, pointing them at ``--setup`` is the wrong advice; they
+        already ran it and the profile exists.
+      - Spurious warnings train users to ignore real ones.
+
+    This test MUST FAIL today for a subtle reason: the warning gate
+    ``source == "fresh"`` is correct per se, but since T2 reveals that
+    the managed branch is UNREACHABLE (managed_profile_path is hardcoded
+    None), any call to ``harvest_waa_token`` with a resolver returning
+    "managed" exercises a codepath that does not exist. The harvester
+    falls through to ``chromium.launch()`` which trips the
+    ``allow_launch=False`` sentinel and raises WAATokenError before the
+    warning block is reached. That is a different failure mode from "no
+    warning emitted", but it is a failure for the RIGHT reason: the
+    managed branch is not wired up.
+
+    Once G1 adds the managed branch, this test protects the contract
+    that the warning stays fresh-only.
+    """
+
+    async def test_no_fresh_warning_when_managed_source(self):
+        import tempfile
+
+        from loguru import logger
+
+        from gemini_webapi.utils.waa_token import harvest_waa_token
+
+        with tempfile.TemporaryDirectory() as td:
+            cache_path = Path(td) / "jspb_templates.json"
+            fake_profile = Path(td) / "managed_profile"
+            fake_profile.mkdir()
+
+            cookies = Cookies()
+            cookies.set("__Secure-1PSID", "sid_x", domain=".google.com")
+
+            page, chromium, _ = _make_cdp_harness()
+            chromium._allow_launch = False  # managed branch is CDP-flavoured
+
+            # Simulate managed path returning an incomplete template set
+            # (flash only). The warning must still stay quiet because
+            # the source is "managed", not "fresh".
+            incomplete_templates = {"flash": _SAMPLE_TEMPLATES["flash"]}
+            mock_capture = AsyncMock(return_value=incomplete_templates)
+            resolve_mock = MagicMock(
+                return_value=("managed", str(fake_profile))
+            )
+
+            records: list = []
+            handler_id = logger.add(
+                lambda msg: records.append(msg.record), level="WARNING"
+            )
+            try:
+                with _managed_path_patch_stack(
+                    chromium,
+                    resolve_mock=resolve_mock,
+                    capture_mock=mock_capture,
+                ):
+                    await harvest_waa_token(
+                        cookies, cache_path=cache_path
+                    )
+            finally:
+                logger.remove(handler_id)
+
+            # No warning record may contain the "fresh-launch path"
+            # substring (the anchor string from waa_token.py:406).
+            fresh_launch_records = [
+                r for r in records
+                if r["level"].name == "WARNING"
+                and "fresh-launch path" in r["message"]
+            ]
+            self.assertEqual(
+                fresh_launch_records,
+                [],
+                "The fresh-launch/Pro-missing WARNING must NOT fire when "
+                "source == 'managed'. The user already ran --setup; "
+                "advising them to run it again is the wrong remediation "
+                "and trains them to ignore real warnings. Got records: "
+                f"{[r['message'] for r in fresh_launch_records]!r}",
+            )
 
 
 if __name__ == "__main__":

@@ -20,14 +20,17 @@ import os
 import platform
 import re
 import shutil
+import subprocess
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs
 
 from loguru import logger
 
+from . import capture_path as _capture_path
 from . import jspb_cache
-from .capture_path import resolve_capture_path
+from .capture_path import MANAGED_CDP_PORT, MANAGED_PROFILE_DIR, resolve_capture_path
 from .template_capture import capture_all_models
 
 # RPC names embedded in Gemini's server-side experiment data that contain
@@ -249,16 +252,19 @@ async def harvest_waa_token(
 
     # Resolve capture transport BEFORE entering playwright context. The CDP
     # path reuses an already-running user Chrome (signed-in state available
-    # for Pro/Thinking); the fresh-launch path keeps today's behaviour.
+    # for Pro/Thinking); the managed path spawns Chrome against the
+    # library-owned signed-in profile and CDP-connects to it; the fresh-launch
+    # path keeps today's behaviour for users without either.
     cdp_url_override = os.environ.get("GEMINI_WAA_CHROME_URL")
     source, url_or_path = resolve_capture_path(
         cdp_url_override=cdp_url_override,
-        managed_profile_path=None,
+        managed_profile_path=MANAGED_PROFILE_DIR,
     )
 
     browser = None
     owns_browser = False
     page = None
+    managed_proc = None
     try:
         async with async_playwright() as p:
             if source == "cdp":
@@ -272,6 +278,56 @@ async def harvest_waa_token(
                     context = await browser.new_context()
                 owns_browser = False
                 # Skip cookie injection — the user's Chrome already carries
+                # valid sign-in state.
+            elif source == "managed":
+                # Spawn Chrome headless against the library-managed signed-in
+                # profile, then CDP-connect. This unlocks Pro/Thinking capture
+                # for users who ran `python -m gemini_webapi.diag --setup`.
+                chrome_path = _find_system_chrome()
+                if not chrome_path:
+                    raise WAATokenError(
+                        "System Chrome not found for managed-profile capture."
+                    )
+                logger.debug(
+                    f"WAA harvester: launching managed Chrome against {url_or_path}"
+                )
+                managed_args = [
+                    chrome_path,
+                    f"--user-data-dir={url_or_path}",
+                    f"--remote-debugging-port={MANAGED_CDP_PORT}",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--headless=new",
+                    "--window-position=-10000,-10000",
+                    "--window-size=1,1",
+                ]
+                managed_proc = subprocess.Popen(
+                    managed_args,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                managed_url = f"http://localhost:{MANAGED_CDP_PORT}"
+                ready = False
+                for _ in range(50):
+                    if _capture_path.probe_cdp_url(managed_url, 0.3):
+                        ready = True
+                        break
+                    time.sleep(0.2)
+                if not ready:
+                    try:
+                        managed_proc.terminate()
+                    except Exception:
+                        pass
+                    raise WAATokenError(
+                        "Managed Chrome failed to expose CDP within timeout"
+                    )
+                browser = await p.chromium.connect_over_cdp(managed_url)
+                if browser.contexts:
+                    context = browser.contexts[0]
+                else:
+                    context = await browser.new_context()
+                owns_browser = False
+                # Skip cookie injection — the managed profile already carries
                 # valid sign-in state.
             else:
                 # Try channel="chrome" first (uses system Chrome, no download)
@@ -385,7 +441,7 @@ async def harvest_waa_token(
                     per_model_templates = captured
                     try:
                         jspb_cache.write_cache(
-                            captured, source="fresh", path=cache_path
+                            captured, source=source, path=cache_path
                         )
                     except Exception as write_err:
                         logger.debug(
@@ -434,3 +490,8 @@ async def harvest_waa_token(
                 pass
         if browser and owns_browser:
             await browser.close()
+        if managed_proc is not None:
+            try:
+                managed_proc.terminate()
+            except Exception:
+                pass

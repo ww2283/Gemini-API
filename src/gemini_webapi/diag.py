@@ -70,8 +70,8 @@ _MODE_PICKER_LABEL: dict[str, str] = {
 }
 
 _DEFAULT_CDP_URL = "http://localhost:9222"
-_MANAGED_PROFILE_DIR = Path("~/.cache/gemini_webapi/chrome_profile").expanduser()
-_MANAGED_CDP_PORT = 9423  # Fixed, unlikely to clash with user tools
+from .utils.capture_path import MANAGED_PROFILE_DIR as _MANAGED_PROFILE_DIR
+from .utils.capture_path import MANAGED_CDP_PORT as _MANAGED_CDP_PORT
 
 
 def _managed_profile_exists() -> bool:

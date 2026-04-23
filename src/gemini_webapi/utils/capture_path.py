@@ -7,6 +7,10 @@ from pathlib import Path
 from typing import Callable
 
 
+MANAGED_PROFILE_DIR = Path("~/.cache/gemini_webapi/chrome_profile").expanduser()
+MANAGED_CDP_PORT = 9423
+
+
 def probe_cdp_url(url: str, timeout_seconds: float = 0.3) -> bool:
     """True iff Chrome responds at {url}/json/version with Browser starts-with 'Chrome/'."""
     try:
