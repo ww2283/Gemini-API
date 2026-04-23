@@ -31,7 +31,14 @@ from loguru import logger
 from . import capture_path as _capture_path
 from . import jspb_cache
 from .capture_path import MANAGED_CDP_PORT, MANAGED_PROFILE_DIR, resolve_capture_path
-from .template_capture import capture_all_models
+from .template_capture import CAPTURE_MODELS, _MODE_LABEL_JS, capture_all_models
+
+# Case-insensitive reverse lookup from mode-picker label to canonical key,
+# used by the initial-submission jspb seeding path in harvest_waa_token.
+_LABEL_TO_KEY: dict[str, str] = {
+    label.strip().casefold(): key
+    for (key, _data_test_id, label, _variant) in CAPTURE_MODELS
+}
 
 # RPC names embedded in Gemini's server-side experiment data that contain
 # model ID arrays.  These map each "mode" (Fast / Thinking / Pro) to an
@@ -425,6 +432,34 @@ async def harvest_waa_token(
             except Exception:
                 pass
 
+            # Probe the currently-selected mode label AFTER the token is
+            # harvested — by this point the page has fully rendered and the
+            # mode-picker button carries its label text. Probing earlier
+            # (right after wait_for_selector on the input) returns '' on
+            # live Gemini because the picker button text populates slightly
+            # later than the input. This cost-free post-harvest probe lets
+            # us seed the per-model cache from the intercepted header even
+            # when capture_all_models's per-mode switch loop comes up empty.
+            try:
+                current_label = await page.evaluate(_MODE_LABEL_JS)
+            except Exception:
+                current_label = ""
+            if not isinstance(current_label, str):
+                current_label = ""
+            initial_mode_key = (
+                _LABEL_TO_KEY.get(current_label.strip().casefold())
+                if current_label
+                else None
+            )
+
+            initial_templates: dict[str, str] = {}
+            if initial_mode_key and reference_headers.get(
+                "x-goog-ext-525001261-jspb"
+            ):
+                initial_templates[initial_mode_key] = reference_headers[
+                    "x-goog-ext-525001261-jspb"
+                ]
+
             # Per-model jspb template capture: only run on cache miss/stale.
             # On a fresh cache hit, reuse the cached templates to skip the
             # expensive mode-switch loop (~30s for 3 models).
@@ -437,11 +472,12 @@ async def harvest_waa_token(
                         f"per-model jspb capture failed: {capture_err}"
                     )
                     captured = None
-                if captured:
-                    per_model_templates = captured
+                merged = {**initial_templates, **(captured or {})}
+                if merged:
+                    per_model_templates = merged
                     try:
                         jspb_cache.write_cache(
-                            captured, source=source, path=cache_path
+                            merged, source=source, path=cache_path
                         )
                     except Exception as write_err:
                         logger.debug(

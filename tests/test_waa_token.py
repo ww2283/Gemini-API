@@ -3255,5 +3255,587 @@ class TestHarvestSuppressesFreshWarningOnManagedSource(
             )
 
 
+# ---------------------------------------------------------------------------
+# R1 (default-mode-free-capture, 2026-04-23):
+# Initial-submission jspb seeds the per-model template cache.
+#
+# Bug confirmed via a live harvest probe on Valuator_AI's managed profile
+# (2026-04-23 12:37):
+#   - The initial "hi" submission DOES capture reference_headers correctly
+#     (x-goog-ext-525001261-jspb is populated).
+#   - But capture_all_models returns {} because the UI is stuck in
+#     "response pending" from the aborted initial StreamGenerate, so each
+#     per-mode capture_one_model call times out.
+#   - Consequently per_model_templates is None, jspb_cache.write_cache is
+#     never called, apply_autopatch has nothing to hotpatch, Pro sends
+#     stale static constants, and the server silently truncates the stream
+#     with batch-execute status [5].
+#
+# The fix: before pressing Enter on the initial "hi", read the mode label
+# via page.evaluate(_MODE_LABEL_JS) and map it back to a canonical key via
+# template_capture.CAPTURE_MODELS. After the initial StreamGenerate fires
+# and reference_headers[x-goog-ext-525001261-jspb] is populated, build
+# initial_templates={<canonical_key>: <raw_jspb>} and merge with
+# capture_all_models output:
+#
+#     per_model_templates = {**initial_templates, **(captured or {})}
+#
+# capture_all_models wins on key collision (it's a more complete capture
+# when available). Write to cache whenever the merged dict is non-empty.
+#
+# These tests MUST FAIL today because:
+#   - harvest_waa_token never reads the mode label before submitting "hi".
+#   - No initial_templates dict is built from reference_headers.
+#   - write_cache is never called when capture_all_models returns {}.
+# ---------------------------------------------------------------------------
+
+
+class _FakePageWithModeLabel(_FakePage):
+    """_FakePage extension that supports configurable page.evaluate() and
+    configurable initial-submission jspb header.
+
+    Adds three knobs the default-mode-free-capture contract exercises:
+      - ``mode_label``: string returned from ``page.evaluate(expr)`` when
+        the expression matches ``_MODE_LABEL_JS`` (or any expression, since
+        the harvester only uses evaluate for the mode-label probe in this
+        codepath). Empty string simulates the "no button found" fallback
+        from the real JS snippet.
+      - ``initial_jspb``: header value seeded on the intercepted route.
+        When None, the jspb header is omitted entirely (simulates the
+        edge case where interception somehow produced no header).
+      - ``evaluate_calls``: list populated with every ``expr`` passed to
+        ``evaluate``. Tests that assert the mode-label probe ran use this
+        as the observable signal.
+
+    Reuses all other _FakePage behaviour verbatim.
+    """
+
+    def __init__(
+        self,
+        *,
+        token: str,
+        botguard_hash: str,
+        reference_inner: list,
+        mode_label: str = "",
+        initial_jspb: str | None = (
+            '[1,null,null,null,"797f3d0293f288ad",'
+            'null,null,0,[4],null,null,3,null,null,3,null,"UUID-HERE"]'
+        ),
+    ):
+        super().__init__(
+            token=token,
+            botguard_hash=botguard_hash,
+            reference_inner=reference_inner,
+        )
+        self._mode_label = mode_label
+        self._initial_jspb = initial_jspb
+        self.evaluate_calls: list[str] = []
+
+    async def evaluate(self, expr, *_a, **_kw):
+        # The only expression the harvester will evaluate on this page
+        # (for the default-mode-free-capture contract) is the mode-label
+        # probe. Record the call so tests can assert the probe fired and
+        # return the configured label verbatim.
+        self.evaluate_calls.append(expr)
+        return self._mode_label
+
+    async def _fire_route(self, *_a, **_kw):
+        if self._route_handler is None:
+            return
+        inner = self._reference_inner
+        post_data = _build_post_data(inner)
+        headers: dict[str, str] = {}
+        if self._initial_jspb is not None:
+            headers["x-goog-ext-525001261-jspb"] = self._initial_jspb
+        fake_route = _FakeRoute(post_data=post_data, headers=headers)
+        await self._route_handler(fake_route)
+
+
+def _make_cdp_harness_with_mode_label(
+    *,
+    mode_label: str,
+    initial_jspb: str | None = (
+        '[1,null,null,null,"797f3d0293f288ad",'
+        'null,null,0,[4],null,null,3,null,null,3,null,"UUID-HERE"]'
+    ),
+):
+    """Like _make_cdp_harness but yields a _FakePageWithModeLabel."""
+    inner = _sample_reference_inner()
+    page = _FakePageWithModeLabel(
+        token="!sample_waa_token_xxxxxxxxxxxxxxxxxxxx",
+        botguard_hash="deadbeefdeadbeef" * 2,
+        reference_inner=inner,
+        mode_label=mode_label,
+        initial_jspb=initial_jspb,
+    )
+    cdp_browser = _FakeCDPBrowser(page)
+    chromium = _FakeChromiumCDP(page, cdp_browser=cdp_browser)
+    return page, chromium, cdp_browser
+
+
+# Canonical initial-submission jspb. Distinguishable from _SAMPLE_TEMPLATES
+# values so key-collision (T2) and source-provenance (T1) assertions can
+# tell the two capture sources apart.
+_INITIAL_SUBMISSION_JSPB_PRO: str = (
+    '[1,null,null,null,"797f3d0293f288ad",'
+    'null,null,0,[4],null,null,3,null,null,3,null,"UUID-HERE"]'
+)
+
+
+class TestHarvestSeedsCacheFromInitialSubmissionWhenCaptureAllEmpty(
+    unittest.IsolatedAsyncioTestCase
+):
+    """
+    R1-T1: When capture_all_models returns ``{}`` (today's live-probe bug
+    — UI stuck in "response pending", every mode-switch capture times out),
+    harvest_waa_token MUST still seed the jspb cache from the initial-
+    submission header it already captured.
+
+    Contract pinned here:
+      - resolve_capture_path → ("managed", "/fake/profile").
+      - Mode label probed pre-submission returns "Pro" (exact label from
+        CAPTURE_MODELS).
+      - Initial StreamGenerate interception populates
+        reference_headers["x-goog-ext-525001261-jspb"].
+      - capture_all_models → {}  (empty — simulates the stuck-UI bug).
+      - EXPECTED: jspb_cache.write_cache is called exactly once with
+        ``templates={"pro": <initial_jspb>}`` and ``source="managed"``
+        (propagated from the resolver result).
+
+    This MUST FAIL today because harvest_waa_token only calls write_cache
+    when capture_all_models returned a non-empty dict — the initial-
+    submission header never makes it into the cache.
+    """
+
+    async def test_initial_seed_written_when_capture_all_empty(self):
+        import tempfile
+
+        from gemini_webapi.utils.waa_token import harvest_waa_token
+
+        with tempfile.TemporaryDirectory() as td:
+            cache_path = Path(td) / "jspb_templates.json"
+            fake_profile = Path(td) / "managed_profile"
+            fake_profile.mkdir()
+
+            cookies = Cookies()
+            cookies.set("__Secure-1PSID", "sid_x", domain=".google.com")
+
+            page, chromium, _ = _make_cdp_harness_with_mode_label(
+                mode_label="Pro",
+                initial_jspb=_INITIAL_SUBMISSION_JSPB_PRO,
+            )
+            # Managed path routes via connect_over_cdp (not launch).
+            chromium._allow_launch = False
+
+            # The bug scenario: capture_all_models returns {} because the
+            # UI is stuck from the aborted initial StreamGenerate.
+            mock_capture = AsyncMock(return_value={})
+            resolve_mock = MagicMock(
+                return_value=("managed", str(fake_profile))
+            )
+            write_cache_spy = MagicMock()
+
+            with _managed_path_patch_stack(
+                chromium,
+                resolve_mock=resolve_mock,
+                capture_mock=mock_capture,
+                write_cache_spy=write_cache_spy,
+            ):
+                result = await harvest_waa_token(
+                    cookies, cache_path=cache_path
+                )
+
+            # capture_all_models was consulted (empty-result branch).
+            self.assertEqual(
+                mock_capture.await_count,
+                1,
+                "capture_all_models must still be invoked — the initial-"
+                "seed shortcut is a merge, not a replacement for the "
+                "full-capture loop.",
+            )
+
+            # write_cache was called exactly once with the initial-
+            # submission jspb keyed by the canonical mode label. This is
+            # the central contract this test pins: the initial-submission
+            # header survives an empty capture_all_models.
+            self.assertEqual(
+                write_cache_spy.call_count,
+                1,
+                "jspb_cache.write_cache must be called exactly once when "
+                "the initial submission produced a mappable header, even "
+                "if capture_all_models returned {}. Today it is not "
+                "called in this scenario — the bug this test pins.",
+            )
+            args, kwargs = write_cache_spy.call_args
+            # Support both positional and keyword forms of the write_cache
+            # call shape: write_cache(templates, source, path=...).
+            templates_value = kwargs.get("templates")
+            if templates_value is None and len(args) >= 1:
+                templates_value = args[0]
+            source_value = kwargs.get("source")
+            if source_value is None and len(args) >= 2:
+                source_value = args[1]
+
+            self.assertEqual(
+                templates_value,
+                {"pro": _INITIAL_SUBMISSION_JSPB_PRO},
+                "write_cache must receive the initial-submission jspb "
+                "keyed by the canonical mode key ('pro'). Got "
+                f"{templates_value!r}.",
+            )
+            self.assertEqual(
+                source_value,
+                "managed",
+                "write_cache source must reflect the resolver result "
+                "('managed'), not a hardcoded constant. Got "
+                f"{source_value!r}.",
+            )
+
+            # The harvester's returned per_model_templates slot must also
+            # include the pro seed (so apply_autopatch downstream has
+            # something to hotpatch).
+            self.assertIsInstance(result, tuple)
+            self.assertEqual(len(result), 7)
+            per_model_templates = result[6]
+            self.assertIsInstance(
+                per_model_templates,
+                dict,
+                "Harvest result[6] must be a dict (not None) when the "
+                "initial submission produced a mappable header.",
+            )
+            self.assertEqual(
+                per_model_templates.get("pro"),
+                _INITIAL_SUBMISSION_JSPB_PRO,
+                "result[6]['pro'] must carry the initial-submission jspb "
+                "so apply_autopatch can hotpatch Pro requests. Got "
+                f"{per_model_templates!r}.",
+            )
+
+
+class TestHarvestFullCaptureWinsOnInitialSeedCollision(
+    unittest.IsolatedAsyncioTestCase
+):
+    """
+    R1-T2: When both the initial-submission capture AND capture_all_models
+    produce a "pro" template, the full-capture value wins. This pins the
+    merge precedence spelled out in the contract:
+
+        per_model_templates = {**initial_templates, **(captured or {})}
+
+    capture_all_models drives the per-mode UI switch explicitly; when it
+    succeeds it's the more complete signal. The initial-submission seed
+    is a fallback, not an override.
+
+    This MUST FAIL today because harvest_waa_token does not build an
+    initial_templates dict at all — the current code path simply passes
+    capture_all_models's return value straight through to write_cache.
+    Once G1 implements the merge, this test guards against an accidental
+    {**captured, **initial} inversion that would silently downgrade Pro
+    to whatever the initial-submission header carried.
+    """
+
+    async def test_capture_all_wins_on_pro_key_collision(self):
+        import tempfile
+
+        from gemini_webapi.utils.template_capture import _MODE_LABEL_JS
+        from gemini_webapi.utils.waa_token import harvest_waa_token
+
+        with tempfile.TemporaryDirectory() as td:
+            cache_path = Path(td) / "jspb_templates.json"
+            fake_profile = Path(td) / "managed_profile"
+            fake_profile.mkdir()
+
+            cookies = Cookies()
+            cookies.set("__Secure-1PSID", "sid_x", domain=".google.com")
+
+            page, chromium, _ = _make_cdp_harness_with_mode_label(
+                mode_label="Pro",
+                initial_jspb=_INITIAL_SUBMISSION_JSPB_PRO,
+            )
+            chromium._allow_launch = False
+
+            # capture_all_models returns a full dict including a Pro
+            # template that DIFFERS from the initial-submission one. The
+            # full-capture Pro value is what must land in the cache.
+            full_capture_pro = _SAMPLE_TEMPLATES["pro"]
+            self.assertNotEqual(
+                full_capture_pro,
+                _INITIAL_SUBMISSION_JSPB_PRO,
+                "Test sanity: the two capture sources must differ so "
+                "the collision-precedence assertion is meaningful.",
+            )
+            full_capture = {
+                "flash": _SAMPLE_TEMPLATES["flash"],
+                "pro": full_capture_pro,
+                "thinking": _SAMPLE_TEMPLATES["thinking"],
+            }
+            mock_capture = AsyncMock(return_value=dict(full_capture))
+            resolve_mock = MagicMock(
+                return_value=("managed", str(fake_profile))
+            )
+            write_cache_spy = MagicMock()
+
+            with _managed_path_patch_stack(
+                chromium,
+                resolve_mock=resolve_mock,
+                capture_mock=mock_capture,
+                write_cache_spy=write_cache_spy,
+            ):
+                result = await harvest_waa_token(
+                    cookies, cache_path=cache_path
+                )
+
+            # Red-phase anchor: the initial-seed codepath MUST probe the
+            # mode label pre-submission. Today no call happens, so this
+            # list is empty — the assertion fails for the right reason
+            # (codepath missing, not a fake-harness artefact).
+            self.assertIn(
+                _MODE_LABEL_JS,
+                page.evaluate_calls,
+                "harvest_waa_token must call page.evaluate(_MODE_LABEL_JS) "
+                "to identify the currently-selected mode BEFORE the "
+                "initial 'hi' submission. Without this call the merge "
+                "contract cannot be honoured (there is no key to key the "
+                f"initial jspb under). Got evaluate_calls={page.evaluate_calls!r}.",
+            )
+
+            self.assertEqual(
+                write_cache_spy.call_count,
+                1,
+                "write_cache must be called exactly once on a full "
+                "capture_all_models success, regardless of the initial "
+                "seed's presence.",
+            )
+            args, kwargs = write_cache_spy.call_args
+            templates_value = kwargs.get("templates")
+            if templates_value is None and len(args) >= 1:
+                templates_value = args[0]
+
+            self.assertEqual(
+                templates_value,
+                full_capture,
+                "On key collision, capture_all_models's value must win "
+                "(it's a more complete per-mode capture). The cache must "
+                "carry the full-capture Pro, not the initial-submission "
+                f"Pro. Got {templates_value!r}.",
+            )
+
+            # Returned dict must also reflect the merge precedence.
+            per_model_templates = result[6]
+            self.assertEqual(
+                per_model_templates.get("pro"),
+                full_capture_pro,
+                "result[6]['pro'] must be the capture_all_models Pro "
+                "value on key collision. Got "
+                f"{per_model_templates!r}.",
+            )
+
+
+class TestHarvestUnknownModeLabelFallsThroughSafely(
+    unittest.IsolatedAsyncioTestCase
+):
+    """
+    R1-T3: If the mode-label probe returns an empty string or an unknown
+    label (e.g. Google rotates the label copy), the harvester MUST skip
+    the initial-templates shortcut silently and rely on
+    capture_all_models alone. The shortcut is best-effort — it cannot
+    reduce coverage when it fails to map.
+
+    Contract pinned here:
+      - page.evaluate(_MODE_LABEL_JS) → ""  (no mappable label).
+      - capture_all_models → {"flash": ...}  (flash-only capture works).
+      - EXPECTED: write_cache called with {"flash": ...} — the initial-
+        submission header is NOT keyed under "pro" (or any other canonical
+        key) because no label mapped.
+      - No exception raised. No spurious key injection.
+
+    This MUST FAIL today because the initial-seed codepath does not exist
+    at all — the test exercises the full-capture branch which today
+    writes {"flash": ...} correctly, but once G1 adds the initial-seed
+    codepath, this test guards against a naive implementation that would
+    either (a) key the initial jspb under the raw (unmapped) label, or
+    (b) crash on an unknown label. The test's red state today is covered
+    by T1 which will fail BEFORE T3 even reaches its assertions, ensuring
+    the contract is pinned as part of the same cycle.
+    """
+
+    async def test_empty_mode_label_falls_through_to_capture_all(self):
+        import tempfile
+
+        from gemini_webapi.utils.template_capture import _MODE_LABEL_JS
+        from gemini_webapi.utils.waa_token import harvest_waa_token
+
+        with tempfile.TemporaryDirectory() as td:
+            cache_path = Path(td) / "jspb_templates.json"
+            fake_profile = Path(td) / "managed_profile"
+            fake_profile.mkdir()
+
+            cookies = Cookies()
+            cookies.set("__Secure-1PSID", "sid_x", domain=".google.com")
+
+            # Empty mode label — the real JS snippet returns "" when the
+            # mode-picker button is not found. Unknown labels (e.g. Google
+            # renames "Pro" to something else) have the same observable
+            # behaviour: no match in CAPTURE_MODELS, no seed written.
+            page, chromium, _ = _make_cdp_harness_with_mode_label(
+                mode_label="",
+                initial_jspb=_INITIAL_SUBMISSION_JSPB_PRO,
+            )
+            chromium._allow_launch = False
+
+            # capture_all_models still works for flash (a bare Playwright
+            # context can always capture flash).
+            flash_only = {"flash": _SAMPLE_TEMPLATES["flash"]}
+            mock_capture = AsyncMock(return_value=dict(flash_only))
+            resolve_mock = MagicMock(
+                return_value=("managed", str(fake_profile))
+            )
+            write_cache_spy = MagicMock()
+
+            with _managed_path_patch_stack(
+                chromium,
+                resolve_mock=resolve_mock,
+                capture_mock=mock_capture,
+                write_cache_spy=write_cache_spy,
+            ):
+                # Must not raise — unknown label is silent fallthrough.
+                result = await harvest_waa_token(
+                    cookies, cache_path=cache_path
+                )
+
+            # Red-phase anchor: the mode-label probe MUST run even when
+            # the returned label is empty — skip-on-unmapped is a
+            # post-probe decision, not a skip-probe-entirely optimisation.
+            # Today the probe never fires; this assertion fails with
+            # evaluate_calls==[] for the right reason.
+            self.assertIn(
+                _MODE_LABEL_JS,
+                page.evaluate_calls,
+                "harvest_waa_token must call page.evaluate(_MODE_LABEL_JS) "
+                "before each harvest, unconditionally. An empty return "
+                "value drives fallthrough; the probe itself must still "
+                f"fire. Got evaluate_calls={page.evaluate_calls!r}.",
+            )
+
+            self.assertEqual(
+                write_cache_spy.call_count,
+                1,
+                "write_cache must still be called once (capture_all_"
+                "models produced flash). Unknown-label fallthrough must "
+                "not suppress a valid full-capture write.",
+            )
+            args, kwargs = write_cache_spy.call_args
+            templates_value = kwargs.get("templates")
+            if templates_value is None and len(args) >= 1:
+                templates_value = args[0]
+
+            self.assertEqual(
+                templates_value,
+                flash_only,
+                "Unmappable mode label must NOT inject any initial-seed "
+                "key into the written templates. Only capture_all_models's "
+                f"flash entry should be present. Got {templates_value!r}.",
+            )
+            # Explicit guard: no "pro" key (the initial-submission header
+            # was for the Pro mode, but without a mappable label we must
+            # not guess the key).
+            self.assertNotIn(
+                "pro",
+                templates_value,
+                "An unmapped label must NOT cause the initial jspb to "
+                "be written under 'pro' (or any canonical key). That "
+                "would smuggle an unverified header into the cache.",
+            )
+
+            # Returned per_model_templates mirrors the cache shape.
+            per_model_templates = result[6]
+            self.assertEqual(per_model_templates, flash_only)
+
+
+class TestHarvestInitialSeedNormalizesModeLabel(
+    unittest.IsolatedAsyncioTestCase
+):
+    """
+    R1-T5: The mode-label probe reads DOM text content. DOM text is
+    whitespace-sensitive and Google has historically shipped the label
+    in mixed case (e.g. "pro" internally but "Pro" in UI). The mapping
+    step from label → canonical key MUST be robust to:
+      - Surrounding whitespace (e.g. "  Pro  ").
+      - Case variation (e.g. "pro", "PRO", "Pro").
+
+    Contract pinned here:
+      - page.evaluate(_MODE_LABEL_JS) → "  pRo  "  (padded + mixed case).
+      - capture_all_models → {}  (same stuck-UI scenario as T1).
+      - EXPECTED: write_cache called with {"pro": <initial_jspb>} —
+        normalization strips whitespace and lowercases before the
+        CAPTURE_MODELS lookup.
+
+    G1 is free to implement via `.strip().casefold()` against a lowercase
+    index of CAPTURE_MODELS labels, or via any equivalent case-insensitive
+    mapping. This test does not pin the mechanism — only the observable
+    normalization behaviour.
+
+    This MUST FAIL today because harvest_waa_token does not read the
+    mode label at all, so no normalization happens.
+    """
+
+    async def test_padded_mixed_case_label_maps_to_canonical_key(self):
+        import tempfile
+
+        from gemini_webapi.utils.waa_token import harvest_waa_token
+
+        with tempfile.TemporaryDirectory() as td:
+            cache_path = Path(td) / "jspb_templates.json"
+            fake_profile = Path(td) / "managed_profile"
+            fake_profile.mkdir()
+
+            cookies = Cookies()
+            cookies.set("__Secure-1PSID", "sid_x", domain=".google.com")
+
+            # Padded + mixed case — must still map to "pro".
+            page, chromium, _ = _make_cdp_harness_with_mode_label(
+                mode_label="  pRo  ",
+                initial_jspb=_INITIAL_SUBMISSION_JSPB_PRO,
+            )
+            chromium._allow_launch = False
+
+            # Same stuck-UI bug scenario as T1 — capture_all_models empty.
+            mock_capture = AsyncMock(return_value={})
+            resolve_mock = MagicMock(
+                return_value=("managed", str(fake_profile))
+            )
+            write_cache_spy = MagicMock()
+
+            with _managed_path_patch_stack(
+                chromium,
+                resolve_mock=resolve_mock,
+                capture_mock=mock_capture,
+                write_cache_spy=write_cache_spy,
+            ):
+                await harvest_waa_token(
+                    cookies, cache_path=cache_path
+                )
+
+            self.assertEqual(
+                write_cache_spy.call_count,
+                1,
+                "write_cache must still fire on a normalized-label "
+                "initial seed. Normalization must happen BEFORE the "
+                "CAPTURE_MODELS lookup gate.",
+            )
+            args, kwargs = write_cache_spy.call_args
+            templates_value = kwargs.get("templates")
+            if templates_value is None and len(args) >= 1:
+                templates_value = args[0]
+
+            self.assertEqual(
+                templates_value,
+                {"pro": _INITIAL_SUBMISSION_JSPB_PRO},
+                "Padded mixed-case mode label '  pRo  ' must normalize "
+                "to canonical key 'pro' before writing. Got "
+                f"{templates_value!r}.",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
