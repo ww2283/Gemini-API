@@ -26,9 +26,7 @@ from loguru import logger
 from ..constants import Model
 
 _JSPB_HEADER_NAME = "x-goog-ext-525001261-jspb"
-_MODEL_ID_SLOT = 4
-_GUARD_SLOT = 8  # Must be [4]
-_VARIANT_SLOT = 14
+_GUARD_SLOT = 8  # Must be [4] when present
 
 _MODEL_KEY_MAP: dict[str, Model] = {
     "pro": Model.G_3_1_PRO,
@@ -46,30 +44,19 @@ def _parse_jspb(value: str) -> list | None:
 
 
 def _is_valid_template(slots: list) -> bool:
-    """Structural sanity checks on a captured jspb header.
+    """Permissive structural validator for live-captured jspb templates.
 
-    A valid Google-side template has:
-    - at least 15 slots (16 is also accepted -- Pro currently sends 16)
-    - slot 0 = 1
-    - slot 4 = 16-char str (model_id, hex)
-    - slot 8 = [4]
-    - slot 14 = int (variant)
-
-    Everything else may legitimately be null or vary. Fail-closed: any
-    mismatch causes the caller to skip hotpatching and keep the static
-    constants.
+    The harvester captures values from StreamGenerate requests that the
+    server actually accepted, so the captured value is by definition
+    wire-valid. The validator's job is only to catch capture errors
+    (empty/wrong header) and protocol-level shifts, not to model
+    Google's per-slot schema.
     """
-    if len(slots) < 15:
+    if not slots:
         return False
     if slots[0] != 1:
         return False
-    model_id = slots[_MODEL_ID_SLOT]
-    if not isinstance(model_id, str) or len(model_id) != 16:
-        return False
-    if slots[_GUARD_SLOT] != [4]:
-        return False
-    variant = slots[_VARIANT_SLOT]
-    if not isinstance(variant, int):
+    if len(slots) > _GUARD_SLOT and slots[_GUARD_SLOT] != [4]:
         return False
     return True
 
