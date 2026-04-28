@@ -461,53 +461,65 @@ class GeminiClient(ChatMixin, GemMixin):
         header = dict(model.model_header)
         jspb_key = "x-goog-ext-525001261-jspb"
         jspb = header.get(jspb_key)
-        if not jspb or not self._discovered_model_ids:
+        if not jspb:
             return header
 
         model_type = self._MODEL_TYPE_MAP.get(model.model_name)
-        if not model_type:
-            return header
+        discovered = (
+            self._discovered_model_ids.get(model_type)
+            if (self._discovered_model_ids and model_type)
+            else None
+        )
 
-        discovered = self._discovered_model_ids.get(model_type)
-        if not discovered:
-            return header
+        if discovered:
+            try:
+                parsed = json.loads(jspb)
+                current_id = parsed[4]
+                current_variant = parsed[11]
 
-        try:
-            parsed = json.loads(jspb)
-            current_id = parsed[4]
-            current_variant = parsed[11]
-
-            if target_variant is not None and target_variant != current_variant:
-                # Caller requests a specific tier — pick from discovered array.
-                # Heuristic: highest variant → last ID, lower → earlier IDs.
-                if target_variant >= len(discovered):
+                if target_variant is not None and target_variant != current_variant:
+                    # Caller requests a specific tier — pick from discovered array.
+                    # Heuristic: highest variant → last ID, lower → earlier IDs.
+                    if target_variant >= len(discovered):
+                        new_id = discovered[-1]
+                    else:
+                        new_id = discovered[max(0, target_variant - 1)]
+                    parsed[4] = new_id
+                    parsed[11] = target_variant
+                    # Ensure jspb has 15 elements with variant at position 14
+                    while len(parsed) < 15:
+                        parsed.append(None)
+                    parsed[14] = target_variant
+                    header[jspb_key] = json.dumps(parsed).decode("utf-8")
+                    logger.info(
+                        f"Resolved {model_type} model for variant {target_variant}: "
+                        f"{current_id} -> {new_id}"
+                    )
+                elif current_id not in discovered:
+                    # Completely stale — replace with last in array
                     new_id = discovered[-1]
-                else:
-                    new_id = discovered[max(0, target_variant - 1)]
-                parsed[4] = new_id
-                parsed[11] = target_variant
-                # Ensure jspb has 15 elements with variant at position 14
-                while len(parsed) < 15:
-                    parsed.append(None)
-                parsed[14] = target_variant
-                header[jspb_key] = json.dumps(parsed).decode("utf-8")
-                logger.info(
-                    f"Resolved {model_type} model for variant {target_variant}: "
-                    f"{current_id} -> {new_id}"
-                )
-            elif current_id not in discovered:
-                # Completely stale — replace with last in array
-                new_id = discovered[-1]
-                new_variant = len(discovered)
-                parsed[4] = new_id
-                parsed[11] = new_variant
-                header[jspb_key] = json.dumps(parsed).decode("utf-8")
-                logger.info(
-                    f"Auto-updated stale {model_type} model ID: "
-                    f"{current_id} -> {new_id} (variant {new_variant})"
-                )
+                    new_variant = len(discovered)
+                    parsed[4] = new_id
+                    parsed[11] = new_variant
+                    header[jspb_key] = json.dumps(parsed).decode("utf-8")
+                    logger.info(
+                        f"Auto-updated stale {model_type} model ID: "
+                        f"{current_id} -> {new_id} (variant {new_variant})"
+                    )
+            except Exception as e:
+                logger.debug(f"Model ID resolution failed: {e}")
+
+        # Inject a fresh per-request UUID at jspb slot 16 (server-side nonce).
+        # Replayed slot-16 values are rejected as of 2026-04-28.
+        try:
+            current_jspb = header.get(jspb_key)
+            if current_jspb:
+                slots = json.loads(current_jspb)
+                if isinstance(slots, list) and len(slots) >= 17:
+                    slots[16] = str(uuid.uuid4()).upper()
+                    header[jspb_key] = json.dumps(slots).decode("utf-8")
         except Exception as e:
-            logger.debug(f"Model ID resolution failed: {e}")
+            logger.debug(f"Slot-16 UUID injection failed: {e}")
 
         return header
 
