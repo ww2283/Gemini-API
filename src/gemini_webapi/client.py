@@ -226,10 +226,15 @@ class GeminiClient(ChatMixin, GemMixin):
                     logger.debug(f"Skipping cookie {name!r} with empty value")
 
         if secure_1psid:
-            self.cookies.set("__Secure-1PSID", secure_1psid, domain=".google.com")
+            self.cookies.set(
+                "__Secure-1PSID", secure_1psid, domain=".google.com", secure=True
+            )
             if secure_1psidts:
                 self.cookies.set(
-                    "__Secure-1PSIDTS", secure_1psidts, domain=".google.com"
+                    "__Secure-1PSIDTS",
+                    secure_1psidts,
+                    domain=".google.com",
+                    secure=True,
                 )
 
     async def _get_waa_token(
